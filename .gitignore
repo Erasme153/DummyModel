@@ -10,16 +10,16 @@ __pycache__/
 .env
 *.local.yaml
 
-# # Large datasets and generated artifacts
-# data/raw/**
-# data/interim/**
-# data/processed/**
-# data/tokenized/**
-# data/packed/**
-# artifacts/checkpoints/**
-# artifacts/hf_exports/**
-# runs/**
-# reports/generated/**
+# Large datasets and generated artifacts
+data/raw/**
+data/interim/**
+data/processed/**
+data/tokenized/**
+data/packed/**
+artifacts/checkpoints/**
+artifacts/hf_exports/**
+runs/**
+reports/generated/**
 
 # # Keep directory markers and documentation
 # !**/.gitkeep

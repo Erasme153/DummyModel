@@ -1,12 +1,12 @@
 # DummyM
 
-DummyM 是一个面向初学者的、从零实现并预训练 Llama-like Decoder-only 语言模型的学习型工程。项目以原生 PyTorch 为核心，目标是在两张 NVIDIA H20 上完整走通模型与 Tokenizer 实现、数据工程、预训练、scaling、分布式训练、评测、后训练和推理流程，而不只是得到一个最终 checkpoint。
+DummyM 是一个面向初学者的、从零实现并预训练 Llama-like Decoder-only 语言模型的学习型工程。项目以原生 PyTorch 为核心，目标是在两张 NVIDIA H20 或等价算力的 GPU 上跑通模型与 Tokenizer 实现、数据工程、预训练、scaling、分布式训练、评测、后训练和推理流程。
 
-> 当前状态：早期开发阶段（alpha，M0 进行中）。miniLLaMA 模型、随机权重生成链路和模型单元测试已经实现；自训练 Tokenizer、预训练数据流水线、训练循环、TorchTitan/FSDP2、正式评测与后训练仍在规划或开发中。本文会明确区分“已经实现”和“计划采用”，避免把路线图当作现有能力。
+> 当前状态：早期开发阶段（alpha，M0 进行中）。miniLLaMA 模型、随机权重生成链路和模型单元测试已经实现；自训练 Tokenizer、预训练数据流水线、训练循环、TorchTitan/FSDP2、正式评测与后训练仍在规划或开发中。
 
 ## 项目定位与 Marin 的关系
 
-DummyM 参考 [Marin](https://github.com/marin-community/marin) 的开放研发方法：训练过程不仅公开最终代码和模型，还应保留实验假设、数据与配置、运行记录、失败结果和复盘材料。DummyM 不是 Marin 的复刻或精简分支，也不会照搬其 TPU/集群基础设施；这里使用 PyTorch、TorchTitan 和两张 H20，重点是让单个学习者能够读懂并亲手实现每一层。
+DummyM 参考 [Marin](https://github.com/marin-community/marin) 的开放研发方法：训练过程公开最终代码和模型，保留实验假设、数据与配置、运行记录、失败结果和复盘材料。这里使用 PyTorch、TorchTitan 和两张 H20，让单个学习者能够读懂并亲手实现每一层。
 
 本项目采用以下原则：
 
@@ -68,7 +68,7 @@ pytest tests/unit/model -q
 
 ### 随机权重生成冒烟测试
 
-下面的命令只验证端到端生成链路。模型参数是随机初始化的，因此输出没有语言意义；借用的是 Tokenizer，不会加载对应模型的权重。
+下面的命令只验证端到端生成链路。模型参数是随机初始化的，借用现有开源模型的 Tokenizer，因此输出没有语言意义。
 
 ```bash
 python scripts/inference/random_prompt_demo.py \
@@ -165,16 +165,33 @@ MoE 不属于当前 dense miniLLaMA 的实现范围。如果后续单独开发 M
 ```text
 pretrain/
 ├── configs/          # 模型、训练、数据、评测和 scaling 配置
+├── experiments/      # 提交到 Git 的实验卡、run 索引与结论
 ├── data/             # 本地数据阶段目录；大文件不进入 Git
 ├── scripts/          # 数据、训练、评测、推理、导出与 profiling 入口
 ├── src/dummym/       # 可复用 Python 包源码
 ├── tests/            # 单元、集成、数值与性能测试
-├── runs/             # 每次运行的轻量元数据和索引
+├── runs/             # 本地自动生成的单次运行目录；不进入 Git
 ├── artifacts/        # checkpoint、Tokenizer、评测及 profile 产物目录
 ├── reports/          # scaling、消融实验和生成报告
 ├── docs/             # 设计文档与开发说明
 ├── notebooks/        # 探索性分析；正式逻辑应迁移到 src/ 或 scripts/
 └── pyproject.toml    # Python 包、依赖与测试配置
+```
+
+## 仓库、模型、实验与数据管理
+
+- **分支管理代码**：`main` 保持可运行；使用短期 `feat/*`、`exp/*`、`fix/*` 分支开发并合并。不要为每次训练创建长期分支，正式 run 应从 `main` 的明确 Git commit 启动。
+- **配置管理模型与 recipe**：模型尺寸、Tokenizer、数据和训练 recipe 放在 `configs/`，用 `v001`、`v002` 等版本区分。某个版本产生正式 run 后即冻结，实质修改复制为新版本。
+- **实验卡管理研究问题**：每个实验在 [`experiments/`](experiments) 下登记假设、对照组、唯一变量、预算、指标、run ID 和结论；实验卡与人工总结进入 Git。
+- **run 管理单次执行**：`runs/` 保存 resolved config、命令、环境、日志和 tracker 元数据，通过唯一 `run_id` 区分 seed 或重复运行；目录由程序生成且不提交 Git，关键索引回填到实验卡。
+- **manifest 管理数据**：大规模数据文件不进入 Git；`data/manifests/` 提交来源 revision、许可证、处理配置、数量、token 统计和哈希。已经用于正式训练的数据版本不可原地覆盖。
+- **外部存储管理产物**：checkpoint、完整训练状态和 profile 放在 `artifacts/` 及远端对象存储；W&B/TensorBoard 管指标，正式发布的 weights-only 模型可上传 Hugging Face，并在实验卡中保存 URI 与哈希。
+
+推荐执行顺序：
+
+```text
+Issue/实验卡 → 短期分支实现 → 测试并合入 main → 从干净 commit 训练
+           → W&B/TensorBoard run → 回填结果 → milestone tag/release
 ```
 
 ## 学习路线与里程碑
@@ -211,5 +228,3 @@ pretrain/
 - [Marin: Train a language model](https://marin.readthedocs.io/en/latest/tutorials/train-an-lm/)：从数据混合、模型配置到训练任务的完整示例。
 - [Marin scaling heuristic recipe](https://github.com/marin-community/marin/blob/main/docs/recipes/add_scaling_heuristic.md)：区分 scaling law 与 training heuristic，并组织 IsoFLOP sweep。
 - [Delphi scaling suite](https://github.com/marin-community/marin/issues/1337)：开放 scaling suite、重复 seed、统一评测和可复现数据顺序的参考。
-
-这些资料用于学习实验设计，不意味着 DummyM 的结果可以直接与 Marin/Delphi 对比。硬件、框架、Tokenizer、数据、计算预算和参数统计口径不同，任何数值比较都必须先重新建立公平基线。
