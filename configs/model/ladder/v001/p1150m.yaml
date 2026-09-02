@@ -1,0 +1,5 @@
+schema_version: 1
+base: common.yaml
+model_id: dummym-v001-p1150m
+target_parameters: 1150000000
+status: dimensions_pending

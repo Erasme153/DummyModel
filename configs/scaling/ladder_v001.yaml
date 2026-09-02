@@ -1,0 +1,12 @@
+schema_version: 1
+ladder_version: v001
+status: scaffold
+models:
+  - id: p039m
+    config: configs/model/ladder/v001/p039m.yaml
+  - id: p1150m
+    config: configs/model/ladder/v001/p1150m.yaml
+
+# Token budgets and compute-optimal schedules will be added after the clean
+# corpus inventory is known.
+

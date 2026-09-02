@@ -1,0 +1,12 @@
+# DummyM current runtime and test dependencies.
+# Python >= 3.10 is required (see pyproject.toml).
+#
+# For NVIDIA H20, install the PyTorch build matching the machine's CUDA/driver
+# before installing this file when a custom index URL is required:
+# https://pytorch.org/get-started/locally/
+
+torch>=2.2
+tokenizers>=0.21,<1
+
+# Test dependency
+pytest>=8

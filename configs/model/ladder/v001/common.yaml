@@ -1,0 +1,15 @@
+schema_version: 1
+ladder_version: v001
+family: llama_like
+status: scaffold
+
+# Shared architectural decisions belong here once validated. Size-specific
+# dimensions belong in the p*.yaml files.
+architecture:
+  decoder_only: true
+  causal: true
+  norm: rmsnorm
+  activation: swiglu
+  position_embedding: rope
+  attention_implementation: pytorch_sdpa
+
