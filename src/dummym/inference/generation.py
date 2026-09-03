@@ -20,6 +20,7 @@ def generate_token_ids(
     max_new_tokens: int,
     temperature: float = 1.0,
     top_k: int | None = 50,
+    top_p: float = 1.0,
     eos_token_id: int | None = None,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
@@ -32,6 +33,9 @@ def generate_token_ids(
         temperature: Sampling temperature. Set to 0 for greedy decoding.
         top_k: Restrict sampling to the highest-scoring K tokens. ``None`` uses
             the full vocabulary.
+        top_p: Keep the smallest set of highest-probability tokens whose
+            cumulative probability reaches this value. ``1.0`` disables
+            nucleus filtering.
         eos_token_id: Stop after this token is sampled, if provided.
         generator: Optional device-local random generator for reproducibility.
 
@@ -50,6 +54,8 @@ def generate_token_ids(
         raise ValueError("temperature must be non-negative")
     if top_k is not None and top_k <= 0:
         raise ValueError("top_k must be positive or None")
+    if not 0.0 < top_p <= 1.0:
+        raise ValueError("top_p must be in (0, 1]")
 
     model.eval()
     generated_ids = input_ids
@@ -64,20 +70,50 @@ def generate_token_ids(
         if temperature == 0:
             next_token_id = next_token_logits.argmax(dim=-1, keepdim=True)
         else:
-            next_token_logits = next_token_logits.float() / temperature
+            sampling_logits = next_token_logits.float() / temperature
 
             if top_k is not None:
-                k = min(top_k, next_token_logits.shape[-1])
-                top_values, top_indices = torch.topk(next_token_logits, k=k, dim=-1)
-                probabilities = torch.softmax(top_values, dim=-1)
-                sampled_top_index = torch.multinomial(
+                k = min(top_k, sampling_logits.shape[-1])
+                top_values, top_indices = torch.topk(sampling_logits, k=k, dim=-1)
+                sampling_logits = torch.full_like(sampling_logits, -torch.inf)
+                sampling_logits.scatter_(
+                    dim=-1,
+                    index=top_indices,
+                    src=top_values,
+                )
+
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(
+                    sampling_logits,
+                    descending=True,
+                    dim=-1,
+                )
+                cumulative_probabilities = torch.softmax(
+                    sorted_logits,
+                    dim=-1,
+                ).cumsum(dim=-1)
+
+                # Shift right so the first token that crosses the threshold is
+                # retained. This also keeps one candidate for tiny top_p values.
+                sorted_indices_to_remove = cumulative_probabilities > top_p
+                sorted_indices_to_remove[..., 1:] = (
+                    sorted_indices_to_remove[..., :-1].clone()
+                )
+                sorted_indices_to_remove[..., 0] = False
+                sorted_logits = sorted_logits.masked_fill(
+                    sorted_indices_to_remove,
+                    -torch.inf,
+                )
+
+                probabilities = torch.softmax(sorted_logits, dim=-1)
+                sampled_sorted_index = torch.multinomial(
                     probabilities,
                     num_samples=1,
                     generator=generator,
                 )
-                next_token_id = top_indices.gather(-1, sampled_top_index)
+                next_token_id = sorted_indices.gather(-1, sampled_sorted_index)
             else:
-                probabilities = torch.softmax(next_token_logits, dim=-1)
+                probabilities = torch.softmax(sampling_logits, dim=-1)
                 next_token_id = torch.multinomial(
                     probabilities,
                     num_samples=1,

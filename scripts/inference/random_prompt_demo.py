@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument(
         "--device",
@@ -105,6 +106,7 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
+        top_p=args.top_p,
         eos_token_id=eos_token_id,
         generator=rng,
     )

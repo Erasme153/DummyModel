@@ -8,6 +8,20 @@ DummyM 是一个面向初学者的、从零实现并预训练 Llama-like Decoder
 
 DummyM 参考 [Marin](https://github.com/marin-community/marin) 的开放研发方法：训练过程公开最终代码和模型，保留实验假设、数据与配置、运行记录、失败结果和复盘材料。这里使用 PyTorch、TorchTitan 和两张 H20，让单个学习者能够读懂并亲手实现每一层。
 
+### 技术栈差异
+
+Marin 是覆盖数据、训练、评测和产物管理的研发框架，其语言模型训练主要由 Levanter 执行；DummyM 当前则自行组织这些流程，并直接使用 PyTorch 实现模型与训练。
+
+| 方面 | Marin / Levanter | DummyM / PyTorch |
+| --- | --- | --- |
+| 核心计算 | JAX + XLA 编译 | PyTorch eager，后续可选 `torch.compile` |
+| 模型与张量 | Equinox + Haliax 具名张量 | `nn.Module` + 普通 Tensor |
+| 分布式 | JAX mesh，按具名轴组织 FSDP/TP | TorchTitan、FSDP2 和 PyTorch DeviceMesh |
+| 主要优势 | 大规模 TPU/GPU 训练、静态图优化、实验与产物复现 | NVIDIA GPU 生态成熟、逐层调试直观、易接入 TRL 和 vLLM |
+| 主要代价 | JIT 编译和函数式编程门槛较高 | 分片、恢复和实验 provenance 需要更显式地实现与验证 |
+
+DummyM 选择 PyTorch 是为了在两张 H20 上优先学习并验证模型数学、训练循环和分布式基础；同时借鉴 Marin 的实验登记、配置冻结、数据缓存、完整恢复和 artifact 追踪方法，而不直接复刻其 JAX 技术栈。
+
 本项目采用以下原则：
 
 - **先正确，再扩展**：每个新功能先在小模型、小数据和单卡上验证，再进入多卡或更大规模。
@@ -34,6 +48,8 @@ DummyM 参考 [Marin](https://github.com/marin-community/marin) 的开放研发�
 ## 模型结构
 
 ```text
+Tokenization（Mistral-7B-v0.1，未来替换为自主训练的Tokenizer）
+      ↓
 Token Embedding
       ↓
 N × Transformer Block
