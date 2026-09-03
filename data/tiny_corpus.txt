@@ -1,0 +1,16 @@
+The small language model learns to predict the next token from the tokens that came before it.
+During this experiment the same tiny batch is repeated until the model can memorize every sequence.
+RMS normalization rescales each hidden vector without subtracting its mean or adding a learned bias.
+Grouped-query attention shares key and value heads while retaining several independent query heads.
+Rotary position embeddings encode relative positions by rotating pairs of query and key coordinates.
+The SwiGLU feed-forward block multiplies an activated gate projection by a second value projection.
+For causal language modeling, the logits at position t are trained to predict the token at position t plus one.
+The optimizer clears old gradients, computes a new backward pass, clips the gradient norm, and updates parameters.
+Tiny overfit is a correctness test: a healthy training pipeline should memorize this deliberately small corpus.
+A saved checkpoint contains model parameters, optimizer state, the completed step, and the configuration used.
+Python example: def square(number): return number * number; the result of square(7) is 49.
+Mathematics example: if x equals three and y equals five, then two times x plus y equals eleven.
+机器学习模型通过重复观察固定样本来验证前向传播、损失函数和反向传播是否正确。
+这个小实验不衡量泛化能力，它只检查模型是否能够记住数量很少的训练序列。
+Tokenization converts text into integer identifiers, and the embedding table converts identifiers into vectors.
+When the training loss approaches zero and token accuracy approaches one, the tiny pipeline has passed its test.

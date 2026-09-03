@@ -1,10 +1,6 @@
-# Configuration layout
+# Configs
 
-- `model/ladder/vNNN/`: one immutable set of model-size configurations.
-- `scaling/`: ladder manifests and scaling-law experiment definitions.
-- `data/` and `tokenizer/`: versioned corpus and tokenizer recipes.
-- `training/`: hardware/runtime settings, separate from model architecture.
-- `evaluation/`, `posttrain/`, `inference/`, `profiling/`: downstream recipes.
+简单实验优先使用脚本默认值和少量命令行参数，不为每次运行创建 YAML。
 
-Do not encode GPU count or local paths in model architecture files.
-
+只有参数需要复用、组合或批量 sweep 时才在这里增加配置。目前这里只保留已经
+开始设计的 model ladder 和 scaling 草案。模型结构配置中不要写本机路径。

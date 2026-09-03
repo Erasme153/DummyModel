@@ -7,6 +7,7 @@
 
 torch>=2.2
 tokenizers>=0.21,<1
+tensorboard>=2.16
 
 # Test dependency
 pytest>=8

@@ -16,21 +16,7 @@ data/interim/**
 data/processed/**
 data/tokenized/**
 data/packed/**
-artifacts/checkpoints/**
-artifacts/hf_exports/**
 runs/**
-reports/generated/**
-
-# # Keep directory markers and documentation
-# !**/.gitkeep
-# !**/README.md
-
-# # Experiment trackers and profilers
-# wandb/
-# *.pt.trace.json
-# *.nsys-rep
-# *.sqlite
 
 # Notebooks
 .ipynb_checkpoints/
-

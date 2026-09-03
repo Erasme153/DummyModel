@@ -2,11 +2,11 @@
 
 DummyM 是一个面向初学者的、从零实现并预训练 Llama-like Decoder-only 语言模型的学习型工程。项目以原生 PyTorch 为核心，目标是在两张 NVIDIA H20 或等价算力的 GPU 上跑通模型与 Tokenizer 实现、数据工程、预训练、scaling、分布式训练、评测、后训练和推理流程。
 
-> 当前状态：早期开发阶段（alpha，M0 进行中）。miniLLaMA 模型、随机权重生成链路和模型单元测试已经实现；自训练 Tokenizer、预训练数据流水线、训练循环、TorchTitan/FSDP2、正式评测与后训练仍在规划或开发中。
+> 当前状态：早期开发阶段（alpha，M0 进行中）。miniLLaMA 模型、随机权重生成链路、模型单元测试和 tiny-corpus overfit 已经实现；自训练 Tokenizer、正式预训练数据流水线、TorchTitan/FSDP2、正式评测与后训练仍在规划或开发中。
 
 ## 项目定位与 Marin 的关系
 
-DummyM 参考 [Marin](https://github.com/marin-community/marin) 的开放研发方法：训练过程公开最终代码和模型，保留实验假设、数据与配置、运行记录、失败结果和复盘材料。这里使用 PyTorch、TorchTitan 和两张 H20，让单个学习者能够读懂并亲手实现每一层。
+DummyM 参考 [Marin](https://github.com/marin-community/marin) 开放代码、模型和实验结论的思路，但不复刻其面向大规模研发的管理体系。这里使用 PyTorch、TorchTitan 和两张 H20 或等价算力 GPU，让学习者能够读懂并亲手实现每一层。
 
 ### 技术栈差异
 
@@ -18,18 +18,15 @@ Marin 是覆盖数据、训练、评测和产物管理的研发框架，其语�
 | 模型与张量 | Equinox + Haliax 具名张量 | `nn.Module` + 普通 Tensor |
 | 分布式 | JAX mesh，按具名轴组织 FSDP/TP | TorchTitan、FSDP2 和 PyTorch DeviceMesh |
 | 主要优势 | 大规模 TPU/GPU 训练、静态图优化、实验与产物复现 | NVIDIA GPU 生态成熟、逐层调试直观、易接入 TRL 和 vLLM |
-| 主要代价 | JIT 编译和函数式编程门槛较高 | 分片、恢复和实验 provenance 需要更显式地实现与验证 |
+| 主要代价 | JIT 编译和函数式编程门槛较高 | 分片、恢复和实验记录需要自行实现与验证 |
 
-DummyM 选择 PyTorch 是为了在两张 H20 上优先学习并验证模型数学、训练循环和分布式基础；同时借鉴 Marin 的实验登记、配置冻结、数据缓存、完整恢复和 artifact 追踪方法，而不直接复刻其 JAX 技术栈。
+DummyM 选择 PyTorch，是为了在两张 H20 上优先学习模型数学、训练循环和分布式基础。当前阶段只记录复现命令、关键参数、结果和结论；真正出现多组对比或大规模训练后，再引入更复杂的配置与追踪工具。
 
 本项目采用以下原则：
 
-- **先正确，再扩展**：每个新功能先在小模型、小数据和单卡上验证，再进入多卡或更大规模。
-- **实验先登记**：正式运行前写清假设、对照组、唯一变量、预算、指标和停止条件；运行后保留成功与失败结论。
-- **配置即实验身份**：代码 commit、配置快照、数据 manifest、Tokenizer 哈希和随机种子共同决定一个 run。
-- **产物有依赖关系**：数据、Tokenizer、checkpoint、评测和报告必须能追溯上游输入，不能只靠文件名猜测。
-- **不同实验族不混比**：模型结构、Tokenizer、数据配比或优化器规则发生实质变化时，新建 recipe/ladder 版本。
-- **先做基线再做研究特性**：AdamW dense baseline 未稳定前，不进入 Muon、Hyperball 或 MoE 对比。
+- **先跑通，再扩展**：每个新功能先用小模型、小数据和单卡验证。
+- **一项实验，一份说明**：在 `experiments/` 下用一个 README 记录目的、命令、结果和结论。
+- **脚本保存过程，README 保存结论**：checkpoint、summary 和 TensorBoard 日志留在本地 `runs/`。
 
 ## 当前实现
 
@@ -42,7 +39,7 @@ DummyM 选择 PyTorch 是为了在两张 H20 上优先学习并验证模型数�
 | Scaling 配置 | 仅有骨架 | `v001` 当前只有 39M 与 1.15B 目标占位文件，具体维度和中间档位尚未确定 |
 | Tokenizer 训练 | 待实现 | 计划使用 Hugging Face Tokenizers 自行训练 BPE |
 | 数据流水线 | 待实现 | 计划使用 Hugging Face Datasets 与 DataTrove |
-| 预训练与分布式 | 待实现 | 计划先完成单卡 reference trainer，再接入 TorchTitan 与 FSDP2 |
+| 预训练与分布式 | 部分实现 | tiny-corpus AdamW 训练已跑通；通用单卡 trainer、TorchTitan 与 FSDP2 待实现 |
 | 评测、后训练和部署 | 待实现 | 计划分别接入 lm-evaluation-harness、TRL 和 vLLM |
 
 ## 模型结构
@@ -70,16 +67,39 @@ Vocabulary logits
 
 核心代码位于 [`src/dummym/models/llama_like`](src/dummym/models/llama_like)。当前实现用于理解和验证模型原理，还没有经过大规模训练正确性与性能验证。
 
-## 快速开始
+## 环境安装
 
-环境要求：Python 3.10 或更高版本、PyTorch 2.2 或更高版本。GPU 环境应先安装与机器 CUDA/驱动相匹配的 PyTorch，再安装本项目。
+环境要求：Python 3.10 或更高版本、PyTorch 2.2 或更高版本。推荐为项目创建
+独立 Conda 环境；下面的 `dummym` 只是示例名称，可以自行替换。
 
 ```bash
 cd /path/to/pretrain
-python -m venv .venv
-source .venv/bin/activate
+conda create --name dummym python=3.10 -y
+conda activate dummym
+python -m pip install --upgrade pip
+```
+
+NVIDIA GPU 用户先打开 [PyTorch Start Locally](https://pytorch.org/get-started/locally/)，
+根据操作系统、Python 和驱动支持情况选择合适的 CUDA 版本，并执行页面生成的
+安装命令。CPU 环境可以直接安装 CPU wheel：
+
+```bash
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+PyTorch 安装完成后，安装 DummyM 及测试依赖：
+
+```bash
 python -m pip install -e ".[dev]"
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
 pytest tests/unit/model -q
+```
+
+以后重新进入项目时只需要激活已经创建的环境：
+
+```bash
+conda activate dummym
+cd /path/to/pretrain
 ```
 
 ### 随机权重生成冒烟测试
@@ -96,6 +116,26 @@ python scripts/inference/random_prompt_demo.py \
 
 H20 环境可将 `--device cpu` 改为 `--device cuda`。脚本默认路径只适用于当前开发机，公开仓库中的用法应始终显式传入 `--tokenizer`。
 
+### Tiny-corpus overfit
+
+这个 M0 实验使用现成的 Mistral 32K Tokenizer，将 [`data/tiny_corpus.txt`](data/tiny_corpus.txt) 的每一行编码后追加 EOS，再拼成一个固定的 `4 × 128` token batch。训练过程始终重复这个 batch，用来检查 tokenization、causal LM loss、反向传播、AdamW 更新和 checkpoint 保存是否能够连通；它不衡量模型的泛化能力。
+
+```bash
+python scripts/train/tiny_overfit.py \
+  --tokenizer /path/to/Mistral-7B-v0.1/tokenizer.json \
+  --device cuda
+```
+
+查看训练曲线：
+
+```bash
+tensorboard --logdir runs/m00_tiny_overfit/tensorboard
+```
+
+2026-09-03 使用 Python 3.10 和 PyTorch 2.5.1+cu124 在单张 NVIDIA H20 上验收（seed 2026）：loss 从 `10.381273` 降至 `0.049335`，第 223 step 达到停止条件，next-token accuracy 为 `1.0000`。训练摘要和 checkpoint 分别保存为 `runs/m00_tiny_overfit/summary.json` 与 `runs/m00_tiny_overfit/checkpoint.pt`；`runs/` 是本地运行产物，不提交 Git。
+
+完整实验结论见 [`experiments/m00_foundations/exp001_tiny_overfit/README.md`](experiments/m00_foundations/exp001_tiny_overfit/README.md)。
+
 ## 模型规模与 Scaling 约定
 
 项目中有两类模型规模，不应混为一谈：
@@ -109,17 +149,13 @@ H20 环境可将 `--device cpu` 改为 `--device cuda`。脚本默认路径只�
 p039m → p077m → p151m → p297m → p584m → p1150m
 ```
 
-版本约定：
+这些尺寸目前只是草案。[`configs/model/ladder/v001`](configs/model/ladder/v001)
+中的配置也仍是占位文件，等 39M/99M 教学实验产生真实数据后再补全，不提前
+建立版本冻结、run ID 等管理规则。
 
-- `v001` 表示一个可比较的实验族；Tokenizer、语料配比、上下文长度、模型结构、优化器策略和参数统计口径应保持一致。
-- `p039m` 等 ID 表示目标参数量，不是产品名称，也不代表当前配置已经精确达到该参数量。
-- 一旦某个 ladder 开始产生正式实验结果，不再原地修改其比较口径；结构性变化进入 `v002`、`v003` 等新目录。
-- 同一配置的重复实验通过独立 `run_id` 区分，禁止覆盖已有结果。
-- 目前 [`configs/model/ladder/v001`](configs/model/ladder/v001) 中的 `p039m.yaml` 和 `p1150m.yaml` 都是 `dimensions_pending` 占位配置；其余四档尚未创建。
-
-这里借鉴 Marin Delphi 的核心区分：**scaling law** 回答“给定算力预算应该训练多大的模型、使用多少 token”，**scaling heuristic/recipe** 回答“这个候选模型应该用什么 learning rate、batch size、optimizer 参数和 schedule 来训练”。不能先随意固定一组模型尺寸，再把它称为 compute-optimal scaling。
-
-在冻结 `v001` 前，需要统一确定词表大小、是否共享输入/输出 Embedding、上下文长度、参数量统计口径、训练 token budget 和各档模型维度。39M/99M/213M 教学实验产生的数据会用于修订 ladder；因此当前六档名称是工程占位，不是最终科学结论。1.15B 训练应在小规模拟合、held-out 预测和双卡容量验证通过后再启动。
+这里仍区分两个问题：**scaling law** 研究给定算力下模型大小和训练 token 数，
+**training recipe** 研究 learning rate、batch size 和 schedule。真正开始 scaling
+实验时再为批量运行增加配置文件。
 
 ## 计划采用的技术栈
 
@@ -161,66 +197,61 @@ Hugging Face Datasets streaming
           本地 NVMe
 ```
 
-原始数据、处理中间产物、tokenized shards、checkpoint 和运行日志不提交到 Git；仓库只保存可复现处理过程所需的配置、脚本、manifest、统计摘要与数据来源说明。
+原始数据、处理中间产物、tokenized shards、checkpoint 和运行日志不提交 Git。
+真正开始使用外部数据时，再补一份简短的数据来源、许可证和处理说明。
 
-## 实验记录规范
+## 实验记录
 
-每个正式 run 至少记录以下信息：
+每项实验在 `experiments/<阶段>/<实验名>/README.md` 中记录：
 
-- 身份信息：Git commit、配置快照、`run_id`、随机种子、环境与依赖版本。
-- 训练曲线：train/validation loss、learning rate、token 数和累计 FLOPs。
-- 数值稳定性：parameter norm、gradient norm、update norm、update/parameter ratio、LM Head norm、logZ 和 z-loss。
-- 系统性能：tokens/s、step time、GPU 显存、TFLOPs 和 MFU。
-- 数据信息：数据源配比、样本数量、过滤统计和训练 token 数。
-- 产物信息：checkpoint、评测结果、profile 和 scaling report 的路径与校验信息。
+- 目的和验收条件；
+- 数据、模型和训练的关键参数；
+- 可直接执行的命令；
+- 实际结果；
+- 结论和下一步。
 
-MoE 不属于当前 dense miniLLaMA 的实现范围。如果后续单独开发 MoE，再增加 expert load、router entropy、router logits、dead experts 和 token drops 等指标，不与当前 dense ladder 混为同一实验族。
+默认不创建实验 YAML、独立 results 文件、run ID 或配置快照。脚本能够清楚表达
+的参数就留在脚本和命令行中；只有开始多组 sweep 时才引入 YAML。checkpoint、
+summary 和 TensorBoard 日志由脚本写入 `runs/<实验名>/`。
 
 ## 目录结构
 
 ```text
 pretrain/
-├── configs/          # 模型、训练、数据、评测和 scaling 配置
-├── experiments/      # 提交到 Git 的实验卡、run 索引与结论
-├── data/             # 本地数据阶段目录；大文件不进入 Git
-├── scripts/          # 数据、训练、评测、推理、导出与 profiling 入口
+├── configs/          # 需要复用或批量运行时才增加的配置
+├── experiments/      # 每项实验一份 README
+├── data/             # 小型测试语料及未来的数据处理目录
+├── scripts/          # 训练、推理和数据处理入口
 ├── src/dummym/       # 可复用 Python 包源码
-├── tests/            # 单元、集成、数值与性能测试
-├── runs/             # 本地自动生成的单次运行目录；不进入 Git
-├── artifacts/        # checkpoint、Tokenizer、评测及 profile 产物目录
-├── reports/          # scaling、消融实验和生成报告
-├── docs/             # 设计文档与开发说明
-├── notebooks/        # 探索性分析；正式逻辑应迁移到 src/ 或 scripts/
+├── tests/            # 自动化测试
+├── runs/             # 本地 checkpoint、summary 和 TensorBoard 日志
 └── pyproject.toml    # Python 包、依赖与测试配置
 ```
 
-## 仓库、模型、实验与数据管理
+## 简化的工作方式
 
-- **分支管理代码**：`main` 保持可运行；使用短期 `feat/*`、`exp/*`、`fix/*` 分支开发并合并。不要为每次训练创建长期分支，正式 run 应从 `main` 的明确 Git commit 启动。
-- **配置管理模型与 recipe**：模型尺寸、Tokenizer、数据和训练 recipe 放在 `configs/`，用 `v001`、`v002` 等版本区分。某个版本产生正式 run 后即冻结，实质修改复制为新版本。
-- **实验卡管理研究问题**：每个实验在 [`experiments/`](experiments) 下登记假设、对照组、唯一变量、预算、指标、run ID 和结论；实验卡与人工总结进入 Git。
-- **run 管理单次执行**：`runs/` 保存 resolved config、命令、环境、日志和 tracker 元数据，通过唯一 `run_id` 区分 seed 或重复运行；目录由程序生成且不提交 Git，关键索引回填到实验卡。
-- **manifest 管理数据**：大规模数据文件不进入 Git；`data/manifests/` 提交来源 revision、许可证、处理配置、数量、token 统计和哈希。已经用于正式训练的数据版本不可原地覆盖。
-- **外部存储管理产物**：checkpoint、完整训练状态和 profile 放在 `artifacts/` 及远端对象存储；W&B/TensorBoard 管指标，正式发布的 weights-only 模型可上传 Hugging Face，并在实验卡中保存 URI 与哈希。
+- 代码放在 `src/` 和 `scripts/`，保持可以直接运行。
+- 每项实验只保留一个 README，成功和失败都写在同一处。
+- 自动生成的训练产物放在 `runs/`，不提交 Git。
+- 当参数组合明显增多时，再增加配置文件和实验追踪工具。
 
-推荐执行顺序：
+当前执行顺序：
 
 ```text
-Issue/实验卡 → 短期分支实现 → 测试并合入 main → 从干净 commit 训练
-           → W&B/TensorBoard run → 回填结果 → milestone tag/release
+实现脚本 → 小数据运行 → 检查结果 → 在实验 README 写结论 → 继续下一步
 ```
 
 ## 学习路线与里程碑
 
-里程碑是按依赖关系排列的课程，不以“代码写完”作为唯一完成标准。每一阶段都必须留下可复现配置、测试、run card、指标和简短复盘，才能进入下一阶段。
+里程碑按学习依赖排列。每一阶段至少留下可运行代码、测试和一份简短实验结论。
 
 | Milestone | 要真正学会什么 | 主要交付物与通过条件 |
 | --- | --- | --- |
-| **M0 · Foundations** | 自己实现 Transformer 与 BPE Tokenizer | 完成 RMSNorm、RoPE、GQA、SwiGLU、causal loss、采样生成；Tokenizer 可训练、保存、重载并稳定复现；通过 shape、mask、数值测试和 tiny-corpus overfit。当前阶段进行中，Qwen Tokenizer 只用于临时生成冒烟测试。 |
-| **M1 · 39M from scratch** | 第一次完整预训练，而不是只会调用 Trainer | 建立数据 manifest、清洗、去重、tokenization、packing、train/validation split；完成单卡训练、定期验证、checkpoint 保存与恢复；loss 明显下降且恢复训练轨迹合理一致。 |
+| **M0 · Foundations** | 自己实现 Transformer 与 BPE Tokenizer | 完成 RMSNorm、RoPE、GQA、SwiGLU、causal loss、采样生成；通过 shape、mask、数值测试和 tiny-corpus overfit。当前 tiny-overfit 已通过，自训练 Tokenizer 待完成。 |
+| **M1 · 39M from scratch** | 第一次完整预训练，而不是只会调用 Trainer | 完成数据清洗、tokenization、packing、train/validation split、单卡训练、验证以及 checkpoint 保存与恢复。 |
 | **M2 · 99M recipe sweep** | 学会控制变量和选择训练 recipe | 在固定模型、数据、token budget 和随机种子策略下，对 LR、AdamW betas/weight decay、warmup/decay schedule 做 sweep；按预先声明的验证 loss、稳定性与吞吐指标选择 recipe，并保留失败实验。新型优化器研究留到 M6，避免变量混杂。 |
 | **M3 · Distributed systems** | DDP、TorchTitan/FSDP2 与 profiling | 对齐单卡和双卡的首步/短程 loss；验证梯度累积、混合精度、分布式 checkpoint 与恢复；用 `torch.profiler`/Nsight 分析吞吐、显存和通信瓶颈。此阶段先做 dense data parallel，EP 留到 M7。 |
-| **M4 · 213M base pretraining** | 运行第一版“正式”base model 训练 | 冻结 Tokenizer、数据 recipe 和 dense 训练 recipe；在两张 H20 上完成可恢复训练；产出 checkpoint、训练报告、base eval、模型卡和完整 provenance。 |
+| **M4 · 213M base pretraining** | 运行第一版“正式”base model 训练 | 确定 Tokenizer、数据和训练方法；在两张 H20 上完成可恢复训练，产出 checkpoint、训练报告、base eval 和模型卡。 |
 | **M5 · Mini-Delphi scaling** | IsoFLOP、scaling law、scaling recipe 与外推验证 | 设计多个 compute budget 和候选 `(参数量, token 数)`；小规模点使用重复 seed；拟合并报告不确定性；用 held-out 规模检验预测，再决定是否运行最高至 1.15B 的 ladder。`Mini-Delphi` 是 DummyM 的教学实验名，不代表 Marin 官方 Delphi 的复现结果。 |
 | **M6 · Optimizer research** | Muon 与 Hyperball 系列方法如何公平比较 | 以 M2/M5 的 AdamW recipe 为固定基线，对 Muon 及 Hyperball 约束版本（如 AdamH/MuonH）做单变量 A/B；记录 loss、吞吐、参数范数和 update/parameter ratio；新优化器使用独立 scaling heuristic，不能直接沿用 AdamW 最优参数。 |
 | **M7 · Mini-MoE systems** | Sparse MoE、Router、负载均衡和 Expert Parallel | 先实现可测试的 top-k router 与专家层，再加入容量、token dispatch/combine、负载与丢 token 指标；将 Quantile Balancing（QB）作为独立路由实验；与 active-parameter/compute 匹配的 dense baseline 比较，最后接入 EP 并 profile 通信。 |
@@ -229,14 +260,12 @@ Issue/实验卡 → 短期分支实现 → 测试并合入 main → 从干净 co
 
 ### 每个里程碑的统一完成标准
 
-一个 milestone 标记完成前，应至少满足：
+一个 milestone 标记完成前，至少满足：
 
-1. **正确性**：有单元/集成测试、短程 loss 检查，并能解释关键 tensor shape 和数学目标。
-2. **可恢复性**：中断后能从 checkpoint 恢复模型、优化器、scheduler、数据位置和随机状态。
-3. **可复现性**：保存 commit、完整配置、依赖与硬件信息、数据/Tokenizer 标识和 seed。
-4. **可比较性**：实验只改变声明的变量，基线、预算、评测协议和统计口径一致。
-5. **可观察性**：同时记录质量、数值稳定性、吞吐、显存和失败原因。
-6. **可交付性**：产出 run card、指标文件、checkpoint/报告索引，以及“学到了什么”的复盘。
+1. 代码可以重新运行，并通过相关测试。
+2. 关键结果符合预期，失败情况也有说明。
+3. checkpoint 等必要产物可以加载。
+4. 实验 README 记录了命令、结果、结论和下一步。
 
 ## 参考项目与方法
 
