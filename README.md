@@ -2,7 +2,7 @@
 
 DummyM 是一个面向初学者的、从零实现并预训练 Llama-like Decoder-only 语言模型的学习型工程。项目以原生 PyTorch 为核心，目标是在两张 NVIDIA H20 或等价算力的 GPU 上跑通模型与 Tokenizer 实现、数据工程、预训练、scaling、分布式训练、评测、后训练和推理流程。
 
-> 当前状态：早期开发阶段（alpha，M0 进行中）。miniLLaMA 模型、随机权重生成链路、模型单元测试和 tiny-corpus overfit 已经实现；自训练 Tokenizer、正式预训练数据流水线、TorchTitan/FSDP2、正式评测与后训练仍在规划或开发中。
+> 当前状态：早期开发阶段（alpha，M1 数据准备、单卡训练和短跑验证已实现）。miniLLaMA 模型、推理、tiny-corpus overfit、本地 FineWeb-Edu 数据准备和 39M 单卡 trainer 已经实现；完整首轮预训练、自训练 Tokenizer、TorchTitan/FSDP2、正式评测与后训练仍待完成。
 
 ## 项目定位与 Marin 的关系
 
@@ -36,10 +36,10 @@ DummyM 选择 PyTorch，是为了在两张 H20 上优先学习模型数学、训
 | Attention backend | 已实现 | 使用 PyTorch SDPA，由 PyTorch 根据运行环境选择可用后端 |
 | 随机权重推理 | 已实现 | 可借用本地 Hugging Face `tokenizer.json` 完成 prompt → token → logits → token → text 的冒烟测试 |
 | 模型单元测试 | 已实现 | 覆盖 RMSNorm、RoPE、模型前向传播和生成逻辑 |
-| Scaling 配置 | 仅有骨架 | `v001` 当前只有 39M 与 1.15B 目标占位文件，具体维度和中间档位尚未确定 |
+| Scaling 配置 | 部分实现 | `v001` 的 39M 配置已补全为 38.94M 参数；更大档位及 scaling 实验仍是草案 |
 | Tokenizer 训练 | 待实现 | 计划使用 Hugging Face Tokenizers 自行训练 BPE |
-| 数据流水线 | 待实现 | 计划使用 Hugging Face Datasets 与 DataTrove |
-| 预训练与分布式 | 部分实现 | tiny-corpus AdamW 训练已跑通；通用单卡 trainer、TorchTitan 与 FSDP2 待实现 |
+| 数据流水线 | 最小版已实现 | 本地 FineWeb-Edu 的分批读取、轻量过滤、精确去重、文档划分和定长 packing；暂用 PyArrow，不依赖 Datasets/DataTrove |
+| 预训练与分布式 | 单卡版已实现 | 39M 的 BF16/AdamW、梯度累积、warmup/cosine、验证、TensorBoard 和恢复已短跑验证；TorchTitan/FSDP2 待实现 |
 | 评测、后训练和部署 | 待实现 | 计划分别接入 lm-evaluation-harness、TRL 和 vLLM |
 
 ## 模型结构
@@ -136,6 +136,63 @@ tensorboard --logdir runs/m00_tiny_overfit/tensorboard
 
 完整实验结论见 [`experiments/m00_foundations/exp001_tiny_overfit/README.md`](experiments/m00_foundations/exp001_tiny_overfit/README.md)。
 
+### M1 数据准备
+
+首轮采用约 39M 模型、单卡、纯 FineWeb-Edu 英文语料和现成的 Mistral 32K
+Tokenizer，准备约 1 亿训练 tokens 与 100 万验证 tokens，序列长度 2048。
+无需等待完整数据集下载完；先使用已有本地分片。数据产物可直接用于下面的
+单卡预训练入口。
+
+数据准备依赖声明在 `.[data]`。新环境缺少依赖时可执行
+`python -m pip install -e ".[data]"`，已有依赖无需重复安装。
+
+```bash
+PYTHONNOUSERSITE=1 python scripts/data/prepare_fineweb.py \
+  --input-dir /path/to/fineweb-edu \
+  --tokenizer /path/to/Mistral-7B-v0.1/tokenizer.json \
+  --output-dir data/tokenized/m01_fineweb_100m
+```
+
+输入是下载仓库根目录，内含 `data/CC-MAIN-*/*.parquet`。脚本先清洗和去重，
+再按文档划分，最后分别编码并追加 EOS、拼成定长行。输出目录必须不存在；生成
+的 `summary.json` 记录完成状态、来源和过滤统计，`preview.jsonl` 供抽查文本。
+数据文件不提交 Git。详见 [M1 实验说明](experiments/m01_pretraining/exp001_39m/README.md)。
+
+2026-09-12 已完成首轮数据准备：48,828 条训练序列（99,999,744 tokens）和
+488 条验证序列（999,424 tokens），均为 2048-token 长度；文档精确去重、split
+隔离、文件尺寸和 token 范围检查通过。
+
+### M1 单卡预训练
+
+模型配置为 8 层、hidden=512、MLP=1408、8 个 Q heads 和 2 个 KV heads，
+共享 embedding，实际参数量 38,937,088。脚本读取现有 `p039m.yaml`，无需额外
+训练 YAML。依赖已声明在 `.[train]`，新环境按需安装，已有环境无需重复安装。
+
+先短跑 100 次更新（`cuda:1` 可按实际空闲设备替换）：
+
+```bash
+PYTHONNOUSERSITE=1 python scripts/train/pretrain.py \
+  --device cuda:1 \
+  --output-dir runs/m01_39m \
+  --stop-after-steps 100
+```
+
+默认使用 BF16、micro-batch=4、累积 4 次、AdamW、100 步 warmup 和 cosine
+衰减。完整计划为 1 epoch / 3052 次更新；短跑暂停不改变学习率计划。
+
+从 checkpoint 继续完成本轮预算：
+
+```bash
+PYTHONNOUSERSITE=1 python scripts/train/pretrain.py \
+  --device cuda:1 --resume runs/m01_39m/checkpoint.pt
+tensorboard --logdir runs/m01_39m/tensorboard
+```
+
+2026-09-14 在 H20 上完成 100 步短跑：训练 loss 从 10.467550 降至 6.956877，
+全量验证 loss 从 10.473185 降至 6.948971。脚本实现及回归检查通过；完整约
+1 亿 token 训练尚未完成。短跑产物单独保存在 `runs/m01_39m_smoke/`，命令、
+恢复约定和统计见 [M1 实验说明](experiments/m01_pretraining/exp001_39m/README.md)。
+
 ## 模型规模与 Scaling 约定
 
 项目中有两类模型规模，不应混为一谈：
@@ -149,8 +206,8 @@ tensorboard --logdir runs/m00_tiny_overfit/tensorboard
 p039m → p077m → p151m → p297m → p584m → p1150m
 ```
 
-这些尺寸目前只是草案。[`configs/model/ladder/v001`](configs/model/ladder/v001)
-中的配置也仍是占位文件，等 39M/99M 教学实验产生真实数据后再补全，不提前
+这些尺寸总体上仍是草案。[`configs/model/ladder/v001`](configs/model/ladder/v001)
+中已补全 M1 使用的 39M 配置，更大档位等教学实验产生真实数据后再补全，不提前
 建立版本冻结、run ID 等管理规则。
 
 这里仍区分两个问题：**scaling law** 研究给定算力下模型大小和训练 token 数，
@@ -173,11 +230,15 @@ p039m → p077m → p151m → p297m → p584m → p1150m
 | 性能分析 | `torch.profiler` + Nsight Systems |
 | Scaling 分析 | NumPy、SciPy、pandas、matplotlib |
 
-除 PyTorch 和 Hugging Face Tokenizers 外，上表多数依赖尚未加入项目依赖，也未完成集成。
+除 PyTorch 和 Hugging Face Tokenizers 外，上表多数方案尚未集成。当前数据准备
+使用 `.[data]` 中的 PyArrow 和 NumPy，先完成本地流程。
 
 ## 数据方案（草案）
 
-候选语料配比为 80% FineWeb-Edu、10% The Stack v2 deduplicated 和 10% OpenWebMath。该比例尚未冻结；下载或训练前还必须核对每个数据源的许可证、访问条件、字段格式、去重范围和实际 token 统计。
+首轮 M1 已选定纯 FineWeb-Edu 英文基线，来源、处理规则及限制记录在实验 README。
+后续候选语料配比为 80% FineWeb-Edu、10% The Stack v2 deduplicated 和 10% OpenWebMath。
+该比例尚未冻结；引入新来源前再核对许可证、访问条件、字段格式、去重范围和实际
+token 统计。下图为后续扩展方案，自训练 Tokenizer 和 DataTrove 不作为本轮前置条件。
 
 ```text
 Hugging Face Datasets streaming
@@ -198,7 +259,7 @@ Hugging Face Datasets streaming
 ```
 
 原始数据、处理中间产物、tokenized shards、checkpoint 和运行日志不提交 Git。
-真正开始使用外部数据时，再补一份简短的数据来源、许可证和处理说明。
+本轮的数据来源、许可证声明和处理说明统一保存在 M1 实验 README。
 
 ## 实验记录
 

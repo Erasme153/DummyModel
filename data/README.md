@@ -1,7 +1,17 @@
 # Data
 
-当前只有可提交 Git 的小型测试语料 `tiny_corpus.txt`。正式获取预训练数据后，
-再按实际需要创建 raw、processed、tokenized 和 validation 等目录，不提前为尚未
-实现的流水线维护 manifest。
+`tiny_corpus.txt` 是可提交 Git 的小型测试语料。M1 使用已下载到项目外的
+`../data/fineweb-edu` 原始 Parquet，由 `scripts/data/prepare_fineweb.py` 抽样、
+轻量过滤、精确去重、按文档划分、编码及 packing。
 
-大型数据文件仍应由 Git 忽略，并保留一份简短的数据来源和处理说明。
+生成的数据放 `data/tokenized/m01_fineweb_100m/`，含独立的 `train.bin` 和
+`validation.bin`、tokenizer 副本、文档索引、预览及一份自动生成的 `summary.json`。
+二进制格式为小端 uint16，每 2048 个 ID 组成一行。只有摘要中 `status=complete`
+才可进入训练，训练代码还应核对文件长度。
+
+读取时先转换为 int64 再传给 PyTorch Embedding；向模型传入相同的 input_ids
+和 labels，由模型内部完成 next-token shift。
+
+命令、数据来源、处理规则及限制见
+[`M1 实验说明`](../experiments/m01_pretraining/exp001_39m/README.md)。大型数据和
+生成索引由 Git 忽略，不维护额外 manifest，也不复制几百 GB 原始语料到项目内。

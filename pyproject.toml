@@ -14,6 +14,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+train = [
+    "numpy>=1.24",
+    "PyYAML>=6",
+]
+data = [
+    "numpy>=1.24",
+    "pyarrow>=14",
+]
 dev = [
     "pytest>=8",
 ]
