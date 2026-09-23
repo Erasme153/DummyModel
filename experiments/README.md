@@ -7,10 +7,19 @@ experiments/
 ├── m00_foundations/
 │   └── exp001_tiny_overfit/
 │       └── README.md
-└── m01_pretraining/
-    └── exp001_39m/
+├── m01_pretraining/
+│   └── exp001_39m/
+│       └── README.md
+└── m02_recipe/
+    ├── exp001_lr_sweep/
+    │   └── README.md
+    └── exp002_warmup/
         └── README.md
 ```
+
+最新报告：[M2：99M Warmup 对比](m02_recipe/exp002_warmup/README.md)。固定
+LR=1e-3，warmup=300 在两个 seed 下均优于 100，当前采用 LR=1e-3、warmup=300。
+前序 [学习率对比](m02_recipe/exp001_lr_sweep/README.md) 保留五组 LR 与 seed 复核结果。
 
 每份 README 只需要回答五个问题：
 

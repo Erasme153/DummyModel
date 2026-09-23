@@ -2,7 +2,7 @@
 
 DummyM 是一个面向初学者的、从零实现并预训练 Llama-like Decoder-only 语言模型的学习型工程。项目以原生 PyTorch 为核心，目标是在两张 NVIDIA H20 或等价算力的 GPU 上跑通模型与 Tokenizer 实现、数据工程、预训练、scaling、分布式训练、评测、后训练和推理流程。
 
-> 当前状态：早期开发阶段（alpha，M1 数据准备、单卡训练和短跑验证已实现）。miniLLaMA 模型、推理、tiny-corpus overfit、本地 FineWeb-Edu 数据准备和 39M 单卡 trainer 已经实现；完整首轮预训练、自训练 Tokenizer、TorchTitan/FSDP2、正式评测与后训练仍待完成。
+> 当前状态：早期开发阶段（alpha）。M1 已完成；M2 已完成 LR 筛选、双 seed 复核、warmup 对比及所选模型的加载/生成检查。当前基线为 `LR=1e-3、warmup=300`，两个 seed 的验证 loss 均值为 3.655440，生成仍有重复和事实错误。下一步为 M3 单卡/双卡一致性验证；自训练 Tokenizer、分布式、正式能力评测与后训练仍待完成。
 
 ## 项目定位与 Marin 的关系
 
@@ -39,7 +39,8 @@ DummyM 选择 PyTorch，是为了在两张 H20 上优先学习模型数学、训
 | Scaling 配置 | 部分实现 | `v001` 的 39M 配置已补全为 38.94M 参数；更大档位及 scaling 实验仍是草案 |
 | Tokenizer 训练 | 待实现 | 计划使用 Hugging Face Tokenizers 自行训练 BPE |
 | 数据流水线 | 最小版已实现 | 本地 FineWeb-Edu 的分批读取、轻量过滤、精确去重、文档划分和定长 packing；暂用 PyArrow，不依赖 Datasets/DataTrove |
-| 预训练与分布式 | 单卡版已实现 | 39M 的 BF16/AdamW、梯度累积、warmup/cosine、验证、TensorBoard 和恢复已短跑验证；TorchTitan/FSDP2 待实现 |
+| 预训练与分布式 | M1 单卡实验已完成 | 39M 已完成约 1 亿 token 训练、验证、恢复和 checkpoint 生成测试；TorchTitan/FSDP2 待实现 |
+| 训练参数对比 | M2 LR 与 warmup 对比已完成 | 99M 当前采用 LR=1e-3、warmup=300，两个 seed 均改善；checkpoint 加载和生成通过，语言能力仍有限 |
 | 评测、后训练和部署 | 待实现 | 计划分别接入 lm-evaluation-harness、TRL 和 vLLM |
 
 ## 模型结构
@@ -188,10 +189,47 @@ PYTHONNOUSERSITE=1 python scripts/train/pretrain.py \
 tensorboard --logdir runs/m01_39m/tensorboard
 ```
 
-2026-09-14 在 H20 上完成 100 步短跑：训练 loss 从 10.467550 降至 6.956877，
-全量验证 loss 从 10.473185 降至 6.948971。脚本实现及回归检查通过；完整约
-1 亿 token 训练尚未完成。短跑产物单独保存在 `runs/m01_39m_smoke/`，命令、
-恢复约定和统计见 [M1 实验说明](experiments/m01_pretraining/exp001_39m/README.md)。
+训练完成后使用通用推理入口加载 checkpoint。Base model 做文本续写，不使用聊天
+模板；默认 `temperature=0`，执行可复现的贪心生成：
+
+```bash
+PYTHONNOUSERSITE=1 python scripts/inference/pretrained_checkpoint_demo.py \
+  --checkpoint runs/m01_39m/checkpoint.pt \
+  --device cuda:1 \
+  --prompt "The future of artificial intelligence" \
+  --max-new-tokens 32
+```
+
+M1 已在 H20 上完成 1 epoch / 3052 次更新，共读取 99,999,744 个输入 tokens。
+正式运行在第 100 步暂停后恢复至结束；全量验证 loss 从 10.473185 降至
+4.153138（perplexity 约 63.63），最后一个训练 batch 的 loss 为 4.103119。
+最终 checkpoint 和日志位于 `runs/m01_39m/`。严格加载和文本生成通过，生成仍有
+复读与语义不连贯，尚不能视为具备可靠语言能力。实测曲线、生成样例、验收结论及
+后续安排见 [M1 实验说明](experiments/m01_pretraining/exp001_39m/README.md)。
+
+### M2 学习率对比
+
+配置 [`configs/model/p099m.yaml`](configs/model/p099m.yaml) 的实际参数量为
+98,913,024。复用 M1 数据、tokenizer 和 trainer，固定训练 seed=2026 与约
+1 亿 token 预算，五组结果如下：
+
+| 峰值 LR | 最终验证 loss | 验证 perplexity |
+| --- | ---: | ---: |
+| 1e-4 | 4.559373 | 95.5235 |
+| 3e-4 | 3.951896 | 52.0339 |
+| 6e-4 | 3.792916 | 44.3856 |
+| 1e-3 | **3.744542** | **42.2896** |
+| 5e-3 | 5.536487 | 253.7849 |
+
+Seed=2027 配对复核中，`6e-4 / 1e-3` 的验证 loss 分别为 3.765396 / 3.713781，
+两个 seed 排名一致，当前选用 `1e-3`，其两次均值为 3.729161。`5e-3` 出现
+多次验证反弹和较大梯度尖峰。完整指标、复现命令和后续安排见
+[M2 学习率报告](experiments/m02_recipe/exp001_lr_sweep/README.md)。
+
+后续固定 LR=1e-3，warmup=300 相比 100 在两个 seed 下均改善：最终验证 loss
+分别为 3.656008、3.654872，均值 3.655440。当前基线更新为 **LR=1e-3、
+warmup=300**。两个 checkpoint 的固定 prompt 生成检查通过，但仍有重复和事实
+错误。详细曲线与 M3 实验步骤见 [Warmup 报告](experiments/m02_recipe/exp002_warmup/README.md)。
 
 ## 模型规模与 Scaling 约定
 
@@ -309,8 +347,8 @@ pretrain/
 | Milestone | 要真正学会什么 | 主要交付物与通过条件 |
 | --- | --- | --- |
 | **M0 · Foundations** | 自己实现 Transformer 与 BPE Tokenizer | 完成 RMSNorm、RoPE、GQA、SwiGLU、causal loss、采样生成；通过 shape、mask、数值测试和 tiny-corpus overfit。当前 tiny-overfit 已通过，自训练 Tokenizer 待完成。 |
-| **M1 · 39M from scratch** | 第一次完整预训练，而不是只会调用 Trainer | 完成数据清洗、tokenization、packing、train/validation split、单卡训练、验证以及 checkpoint 保存与恢复。 |
-| **M2 · 99M recipe sweep** | 学会控制变量和选择训练 recipe | 在固定模型、数据、token budget 和随机种子策略下，对 LR、AdamW betas/weight decay、warmup/decay schedule 做 sweep；按预先声明的验证 loss、稳定性与吞吐指标选择 recipe，并保留失败实验。新型优化器研究留到 M6，避免变量混杂。 |
+| **M1 · 39M from scratch** | 第一次完整预训练，而不是只会调用 Trainer | 已完成数据准备、约 1 亿 token 单卡训练、独立验证、checkpoint 保存/恢复及生成测试。最终验证 loss 4.153138；生成能力有限。 |
+| **M2 · 99M recipe sweep** | 学会控制变量和选择训练 recipe | 已完成 LR 筛选、双 seed 复核、warmup 对比与所选模型生成验收；当前基线 LR=1e-3、warmup=300。其他单变量实验按需开展，保留退化结果；新型优化器留到 M6。 |
 | **M3 · Distributed systems** | DDP、TorchTitan/FSDP2 与 profiling | 对齐单卡和双卡的首步/短程 loss；验证梯度累积、混合精度、分布式 checkpoint 与恢复；用 `torch.profiler`/Nsight 分析吞吐、显存和通信瓶颈。此阶段先做 dense data parallel，EP 留到 M7。 |
 | **M4 · 213M base pretraining** | 运行第一版“正式”base model 训练 | 确定 Tokenizer、数据和训练方法；在两张 H20 上完成可恢复训练，产出 checkpoint、训练报告、base eval 和模型卡。 |
 | **M5 · Mini-Delphi scaling** | IsoFLOP、scaling law、scaling recipe 与外推验证 | 设计多个 compute budget 和候选 `(参数量, token 数)`；小规模点使用重复 seed；拟合并报告不确定性；用 held-out 规模检验预测，再决定是否运行最高至 1.15B 的 ladder。`Mini-Delphi` 是 DummyM 的教学实验名，不代表 Marin 官方 Delphi 的复现结果。 |
