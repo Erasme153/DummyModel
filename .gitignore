@@ -20,3 +20,6 @@ runs/**
 
 # Notebooks
 .ipynb_checkpoints/
+tmp/
+*.nsys-rep
+*.sqlite
