@@ -10,16 +10,22 @@ experiments/
 ├── m01_pretraining/
 │   └── exp001_39m/
 │       └── README.md
-└── m02_recipe/
-    ├── exp001_lr_sweep/
-    │   └── README.md
-    └── exp002_warmup/
+├── m02_recipe/
+│   ├── exp001_lr_sweep/
+│   │   └── README.md
+│   └── exp002_warmup/
+│       └── README.md
+└── m03_distributed/
+    └── exp001_ddp/
         └── README.md
 ```
 
-最新报告：[M2：99M Warmup 对比](m02_recipe/exp002_warmup/README.md)。固定
-LR=1e-3，warmup=300 在两个 seed 下均优于 100，当前采用 LR=1e-3、warmup=300。
-前序 [学习率对比](m02_recipe/exp001_lr_sweep/README.md) 保留五组 LR 与 seed 复核结果。
+最新报告：[M3：单卡 / 双卡 DDP](m03_distributed/exp001_ddp/README.md)。
+99M 的双 GPU 完整预算对照已完成：最终验证 loss 单卡 3.657353、双卡 3.657155，
+稳态全局训练吞吐双卡约为单卡的 1.95 倍。40 步 Nsight profiling 已完成，
+FSDP2 尚未实现。前序
+[M2 Warmup 对比](m02_recipe/exp002_warmup/README.md)
+确定的基线仍为 LR=1e-3、warmup=300。
 
 每份 README 只需要回答五个问题：
 

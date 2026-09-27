@@ -2,7 +2,7 @@
 
 DummyM 是一个面向初学者的、从零实现并预训练 Llama-like Decoder-only 语言模型的学习型工程。项目以原生 PyTorch 为核心，目标是在两张 NVIDIA H20 或等价算力的 GPU 上跑通模型与 Tokenizer 实现、数据工程、预训练、scaling、分布式训练、评测、后训练和推理流程。
 
-> 当前状态：早期开发阶段（alpha）。M1 已完成；M2 已完成 LR 筛选、双 seed 复核、warmup 对比及所选模型的加载/生成检查。当前基线为 `LR=1e-3、warmup=300`，两个 seed 的验证 loss 均值为 3.655440，生成仍有重复和事实错误。下一步为 M3 单卡/双卡一致性验证；自训练 Tokenizer、分布式、正式能力评测与后训练仍待完成。
+> 当前状态：早期开发阶段（alpha）。M1 已完成；M2 已完成 LR 筛选、双 seed 复核、warmup 对比及所选模型的加载/生成检查。当前基线为 `LR=1e-3、warmup=300`，两个 seed 的验证 loss 均值为 3.655440，生成仍有重复和事实错误。M3 的 99M 单卡/双卡 DDP 完整预算对照已通过：最终验证 loss 分别为 3.657353/3.657155，双卡全局训练吞吐约为单卡的 1.95 倍；40 步 Nsight profiling 已完成，FSDP2 尚未实现。自训练 Tokenizer、正式能力评测与后训练仍待完成。
 
 ## 项目定位与 Marin 的关系
 
@@ -39,7 +39,7 @@ DummyM 选择 PyTorch，是为了在两张 H20 上优先学习模型数学、训
 | Scaling 配置 | 部分实现 | `v001` 的 39M 配置已补全为 38.94M 参数；更大档位及 scaling 实验仍是草案 |
 | Tokenizer 训练 | 待实现 | 计划使用 Hugging Face Tokenizers 自行训练 BPE |
 | 数据流水线 | 最小版已实现 | 本地 FineWeb-Edu 的分批读取、轻量过滤、精确去重、文档划分和定长 packing；暂用 PyArrow，不依赖 Datasets/DataTrove |
-| 预训练与分布式 | M1 单卡实验已完成 | 39M 已完成约 1 亿 token 训练、验证、恢复和 checkpoint 生成测试；TorchTitan/FSDP2 待实现 |
+| 预训练与分布式 | 单卡与 DDP 对照已验收 | `pretrain_ddp.py` 的 CPU 测试、99M 双 GPU/NCCL/BF16 完整预算对照和 Nsight 短程剖析已完成；TorchTitan/FSDP2 待实现 |
 | 训练参数对比 | M2 LR 与 warmup 对比已完成 | 99M 当前采用 LR=1e-3、warmup=300，两个 seed 均改善；checkpoint 加载和生成通过，语言能力仍有限 |
 | 评测、后训练和部署 | 待实现 | 计划分别接入 lm-evaluation-harness、TRL 和 vLLM |
 
@@ -231,6 +231,27 @@ Seed=2027 配对复核中，`6e-4 / 1e-3` 的验证 loss 分别为 3.765396 / 3.
 warmup=300**。两个 checkpoint 的固定 prompt 生成检查通过，但仍有重复和事实
 错误。详细曲线与 M3 实验步骤见 [Warmup 报告](experiments/m02_recipe/exp002_warmup/README.md)。
 
+### M3 单卡 / 双卡 DDP
+
+新增入口 [`scripts/train/pretrain_ddp.py`](scripts/train/pretrain_ddp.py)，保留原单卡
+脚本。默认沿用 M2 的 99M、LR=1e-3、warmup=300 与现有约 1 亿 token 数据。
+
+```bash
+# 复现时确认两张卡空闲；已有 runs/m03_99m_ddp 不能覆盖。
+CUDA_VISIBLE_DEVICES=0,1 PYTHONNOUSERSITE=1 \
+torchrun --standalone --nproc-per-node=2 scripts/train/pretrain_ddp.py \
+  --device cuda --batch-size 4 --grad-accum-steps 2 \
+  --output-dir runs/m03_99m_ddp --stop-after-steps 100
+```
+
+这里 batch 与累积次数均为**每卡**数值，全局 batch 为 `4 × 2 × 2 = 16`。
+单卡对照使用同一入口，将累积改为 4，并指定另一个输出目录。两组均已从
+100 步恢复至 400 步，再完成 3052 步和约 1 亿输入 tokens；最终验证 loss
+分别为 3.657353 和 3.657155。40 步 Nsight profiling 的稳定更新区间加速比
+约为 1.94 倍。只有 rank 0 写 TensorBoard 和 checkpoint；恢复要求卡数及
+训练约定一致。详细命令、结果和指标口径见
+[M3 实验说明](experiments/m03_distributed/exp001_ddp/README.md)。
+
 ## 模型规模与 Scaling 约定
 
 项目中有两类模型规模，不应混为一谈：
@@ -257,7 +278,7 @@ p039m → p077m → p151m → p297m → p584m → p1150m
 | 环节 | 计划方案 |
 | --- | --- |
 | 模型与基础训练 | 原生 PyTorch |
-| 双卡与大模型训练 | TorchTitan + FSDP2 |
+| 双卡与大模型训练 | 当前原生 DDP；后续 TorchTitan + FSDP2 |
 | Attention | PyTorch SDPA / Flash Attention backend |
 | 数据处理 | Hugging Face Datasets + DataTrove |
 | Tokenizer | Hugging Face Tokenizers，自训练 BPE |
@@ -349,7 +370,7 @@ pretrain/
 | **M0 · Foundations** | 自己实现 Transformer 与 BPE Tokenizer | 完成 RMSNorm、RoPE、GQA、SwiGLU、causal loss、采样生成；通过 shape、mask、数值测试和 tiny-corpus overfit。当前 tiny-overfit 已通过，自训练 Tokenizer 待完成。 |
 | **M1 · 39M from scratch** | 第一次完整预训练，而不是只会调用 Trainer | 已完成数据准备、约 1 亿 token 单卡训练、独立验证、checkpoint 保存/恢复及生成测试。最终验证 loss 4.153138；生成能力有限。 |
 | **M2 · 99M recipe sweep** | 学会控制变量和选择训练 recipe | 已完成 LR 筛选、双 seed 复核、warmup 对比与所选模型生成验收；当前基线 LR=1e-3、warmup=300。其他单变量实验按需开展，保留退化结果；新型优化器留到 M6。 |
-| **M3 · Distributed systems** | DDP、TorchTitan/FSDP2 与 profiling | 对齐单卡和双卡的首步/短程 loss；验证梯度累积、混合精度、分布式 checkpoint 与恢复；用 `torch.profiler`/Nsight 分析吞吐、显存和通信瓶颈。此阶段先做 dense data parallel，EP 留到 M7。 |
+| **M3 · Distributed systems** | DDP、TorchTitan/FSDP2 与 profiling | 单卡/双卡 DDP 的完整预算一致性、恢复、吞吐、显存对照及 Nsight 短程剖析已完成；TorchTitan/FSDP2 待实现。此阶段先做 dense data parallel，EP 留到 M7。 |
 | **M4 · 213M base pretraining** | 运行第一版“正式”base model 训练 | 确定 Tokenizer、数据和训练方法；在两张 H20 上完成可恢复训练，产出 checkpoint、训练报告、base eval 和模型卡。 |
 | **M5 · Mini-Delphi scaling** | IsoFLOP、scaling law、scaling recipe 与外推验证 | 设计多个 compute budget 和候选 `(参数量, token 数)`；小规模点使用重复 seed；拟合并报告不确定性；用 held-out 规模检验预测，再决定是否运行最高至 1.15B 的 ladder。`Mini-Delphi` 是 DummyM 的教学实验名，不代表 Marin 官方 Delphi 的复现结果。 |
 | **M6 · Optimizer research** | Muon 与 Hyperball 系列方法如何公平比较 | 以 M2/M5 的 AdamW recipe 为固定基线，对 Muon 及 Hyperball 约束版本（如 AdamH/MuonH）做单变量 A/B；记录 loss、吞吐、参数范数和 update/parameter ratio；新优化器使用独立 scaling heuristic，不能直接沿用 AdamW 最优参数。 |
