@@ -2,7 +2,7 @@
 
 DummyM 是一个面向初学者的、从零实现并预训练 Llama-like Decoder-only 语言模型的学习型工程。项目以原生 PyTorch 为核心，目标是在两张 NVIDIA H20 或等价算力的 GPU 上跑通模型与 Tokenizer 实现、数据工程、预训练、scaling、分布式训练、评测、后训练和推理流程。
 
-> 当前状态：早期开发阶段（alpha）。M1 已完成；M2 已完成 LR 筛选、双 seed 复核、warmup 对比及所选模型的加载/生成检查。当前基线为 `LR=1e-3、warmup=300`，两个 seed 的验证 loss 均值为 3.655440，生成仍有重复和事实错误。M3 的 99M 单卡/双卡 DDP 完整预算对照已通过：最终验证 loss 分别为 3.657353/3.657155，双卡全局训练吞吐约为单卡的 1.95 倍；40 步 Nsight profiling 已完成，FSDP2 尚未实现。自训练 Tokenizer、正式能力评测与后训练仍待完成。
+> 当前状态：M1–M4 已完成。M4 的 213M base model 已训练 1B tokens，同集验证 loss 为 2.878212；M5 已完成初步等算力对照、低预算配对 seed 和 `2.00e17` 留出预算验证。结论只适用于已测模型与预算，尚无可靠的大模型外推。详见 [M4 报告](experiments/m04_base/exp001_213m/README.md)和 [M5 报告](experiments/m05_scaling/exp001_isoflop/README.md)。
 
 ## 项目定位与 Marin 的关系
 
@@ -36,12 +36,12 @@ DummyM 选择 PyTorch，是为了在两张 H20 上优先学习模型数学、训
 | Attention backend | 已实现 | 使用 PyTorch SDPA，由 PyTorch 根据运行环境选择可用后端 |
 | 随机权重推理 | 已实现 | 可借用本地 Hugging Face `tokenizer.json` 完成 prompt → token → logits → token → text 的冒烟测试 |
 | 模型单元测试 | 已实现 | 覆盖 RMSNorm、RoPE、模型前向传播和生成逻辑 |
-| Scaling 配置 | 部分实现 | `v001` 的 39M 配置已补全为 38.94M 参数；更大档位及 scaling 实验仍是草案 |
+| Scaling 配置 | 初步等算力对照已完成 | 39M、99M、213M 已在两档近似算力预算下比较；更大 ladder 与 scaling law 仍待验证 |
 | Tokenizer 训练 | 待实现 | 计划使用 Hugging Face Tokenizers 自行训练 BPE |
 | 数据流水线 | 最小版已实现 | 本地 FineWeb-Edu 的分批读取、轻量过滤、精确去重、文档划分和定长 packing；暂用 PyArrow，不依赖 Datasets/DataTrove |
-| 预训练与分布式 | 单卡与 DDP 对照已验收 | `pretrain_ddp.py` 的 CPU 测试、99M 双 GPU/NCCL/BF16 完整预算对照和 Nsight 短程剖析已完成；TorchTitan/FSDP2 待实现 |
+| 预训练与分布式 | M3 已验收 | 99M 单卡/DDP/FSDP2 完整预算对照、恢复与加载，Nsight 短程剖析及 213M 双卡短跑已完成；TorchTitan 待实现 |
 | 训练参数对比 | M2 LR 与 warmup 对比已完成 | 99M 当前采用 LR=1e-3、warmup=300，两个 seed 均改善；checkpoint 加载和生成通过，语言能力仍有限 |
-| 评测、后训练和部署 | 待实现 | 计划分别接入 lm-evaluation-harness、TRL 和 vLLM |
+| 评测、后训练和部署 | Base eval 已实现 | 已接入同集 loss 评测与 lm-evaluation-harness 零样本任务；TRL 和 vLLM 待实现 |
 
 ## 模型结构
 
@@ -250,7 +250,7 @@ torchrun --standalone --nproc-per-node=2 scripts/train/pretrain_ddp.py \
 分别为 3.657353 和 3.657155。40 步 Nsight profiling 的稳定更新区间加速比
 约为 1.94 倍。只有 rank 0 写 TensorBoard 和 checkpoint；恢复要求卡数及
 训练约定一致。详细命令、结果和指标口径见
-[M3 实验说明](experiments/m03_distributed/exp001_ddp/README.md)。
+[M3 实验说明](experiments/m03_distributed/exp001_parallelism/README.md)。
 
 ## 模型规模与 Scaling 约定
 
@@ -278,7 +278,7 @@ p039m → p077m → p151m → p297m → p584m → p1150m
 | 环节 | 计划方案 |
 | --- | --- |
 | 模型与基础训练 | 原生 PyTorch |
-| 双卡与大模型训练 | 当前原生 DDP；后续 TorchTitan + FSDP2 |
+| 双卡与大模型训练 | 原生 DDP 与 FSDP2；TorchTitan 待接入 |
 | Attention | PyTorch SDPA / Flash Attention backend |
 | 数据处理 | Hugging Face Datasets + DataTrove |
 | Tokenizer | Hugging Face Tokenizers，自训练 BPE |
@@ -370,9 +370,9 @@ pretrain/
 | **M0 · Foundations** | 自己实现 Transformer 与 BPE Tokenizer | 完成 RMSNorm、RoPE、GQA、SwiGLU、causal loss、采样生成；通过 shape、mask、数值测试和 tiny-corpus overfit。当前 tiny-overfit 已通过，自训练 Tokenizer 待完成。 |
 | **M1 · 39M from scratch** | 第一次完整预训练，而不是只会调用 Trainer | 已完成数据准备、约 1 亿 token 单卡训练、独立验证、checkpoint 保存/恢复及生成测试。最终验证 loss 4.153138；生成能力有限。 |
 | **M2 · 99M recipe sweep** | 学会控制变量和选择训练 recipe | 已完成 LR 筛选、双 seed 复核、warmup 对比与所选模型生成验收；当前基线 LR=1e-3、warmup=300。其他单变量实验按需开展，保留退化结果；新型优化器留到 M6。 |
-| **M3 · Distributed systems** | DDP、TorchTitan/FSDP2 与 profiling | 单卡/双卡 DDP 的完整预算一致性、恢复、吞吐、显存对照及 Nsight 短程剖析已完成；TorchTitan/FSDP2 待实现。此阶段先做 dense data parallel，EP 留到 M7。 |
-| **M4 · 213M base pretraining** | 运行第一版“正式”base model 训练 | 确定 Tokenizer、数据和训练方法；在两张 H20 上完成可恢复训练，产出 checkpoint、训练报告、base eval 和模型卡。 |
-| **M5 · Mini-Delphi scaling** | IsoFLOP、scaling law、scaling recipe 与外推验证 | 设计多个 compute budget 和候选 `(参数量, token 数)`；小规模点使用重复 seed；拟合并报告不确定性；用 held-out 规模检验预测，再决定是否运行最高至 1.15B 的 ladder。`Mini-Delphi` 是 DummyM 的教学实验名，不代表 Marin 官方 Delphi 的复现结果。 |
+| **M3 · Distributed systems** | DDP、FSDP2 与 profiling | 单卡/DDP/FSDP2 的 99M 完整预算一致性、恢复、吞吐、显存对照，Nsight 短程剖析及 213M 双卡短跑已完成；TorchTitan 待接入，EP 留到 M7。 |
+| **M4 · 213M base pretraining** | 运行第一版“正式”base model 训练 | 已完成双卡 1B-token 训练、checkpoint、同集 loss 和零样本 base eval；模型卡与限制见 [M4 报告](experiments/m04_base/exp001_213m/README.md)。 |
+| **M5 · Mini-Delphi scaling** | IsoFLOP、scaling law、scaling recipe 与外推验证 | 已完成两档初步等算力对照、39M/99M 配对 seed 和 `2.00e17` 留出预算检查，见 [M5 报告](experiments/m05_scaling/exp001_isoflop/README.md)。39M 在已测低预算内更优；现有数据不足以确定全局计算最优规模或外推大模型。`Mini-Delphi` 是 DummyM 的教学实验名，不代表 Marin 官方 Delphi 的复现结果。 |
 | **M6 · Optimizer research** | Muon 与 Hyperball 系列方法如何公平比较 | 以 M2/M5 的 AdamW recipe 为固定基线，对 Muon 及 Hyperball 约束版本（如 AdamH/MuonH）做单变量 A/B；记录 loss、吞吐、参数范数和 update/parameter ratio；新优化器使用独立 scaling heuristic，不能直接沿用 AdamW 最优参数。 |
 | **M7 · Mini-MoE systems** | Sparse MoE、Router、负载均衡和 Expert Parallel | 先实现可测试的 top-k router 与专家层，再加入容量、token dispatch/combine、负载与丢 token 指标；将 Quantile Balancing（QB）作为独立路由实验；与 active-parameter/compute 匹配的 dense baseline 比较，最后接入 EP 并 profile 通信。 |
 | **M8 · Midtraining & cooldown** | 数据混合变化与学习率退火如何影响能力 | 从同一 base checkpoint 分叉，对高质量/领域数据配比、阶段 token budget 和 cooldown schedule 做受控实验；同时看通用能力保持、目标能力增益和遗忘，而不只看单项 benchmark。 |

@@ -5,6 +5,19 @@ status: ready
 
 # 约 99M 的 M2 候选架构，实际参数量为 98,913,024。
 # 参数数量已核算，训练稳定性和吞吐仍需短跑验证。
+# 参数量计算公式：
+#   Embedding 参数量 = vocab_size * hidden_size
+#   LM Head 参数量 = Embedding 参数量（当前实现方式为 tie_word_embeddings，与 Embedding 共享参数）
+#   每层 Attention 参数量 
+#       Q Projection = num_attention_heads * (hidden_size / num_attention_heads) * hidden_size
+#       K Projection = num_key_value_heads * (hidden_size / num_attention_heads) * hidden_size
+#       V Projection = num_key_value_heads * (hidden_size / num_attention_heads) * hidden_size
+#       O Projection = num_attention_heads * (hidden_size / num_attention_heads)
+#       Attention 参数量 = Q + K + V + O
+#    每层激活函数参数量 = 3*hidden_size * intermediate_size  （MLP / SwiGLU）
+#    每层两个 RMSNorm 参数量 = 2 * hidden_size
+#    一个 Transformer 层参数量 = Attention + 激活函数 + RMSNorm
+#    总参数量 = Embedding + LM Head（这里不计算） + num_hidden_layers * 一个 Transformer 层参数量 + RMSNorm（最后一层） + 其他参数量（如 RoPE、LayerNorm 等）
 model_config:
   vocab_size: 32000
   hidden_size: 768

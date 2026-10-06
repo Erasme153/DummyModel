@@ -1,6 +1,7 @@
 # Experiments
 
 这是学习项目，实验记录保持简单：一个实验目录只放一个 `README.md`。
+`expNNN` 在各里程碑目录内分别编号，所以不同里程碑可以都有 `exp001`。
 
 ```text
 experiments/
@@ -15,17 +16,22 @@ experiments/
 │   │   └── README.md
 │   └── exp002_warmup/
 │       └── README.md
-└── m03_distributed/
-    └── exp001_ddp/
+├── m03_distributed/
+│   └── exp001_parallelism/
+│       └── README.md
+├── m04_base/
+│   └── exp001_213m/
+│       └── README.md
+└── m05_scaling/
+    └── exp001_isoflop/
         └── README.md
 ```
 
-最新报告：[M3：单卡 / 双卡 DDP](m03_distributed/exp001_ddp/README.md)。
-99M 的双 GPU 完整预算对照已完成：最终验证 loss 单卡 3.657353、双卡 3.657155，
-稳态全局训练吞吐双卡约为单卡的 1.95 倍。40 步 Nsight profiling 已完成，
-FSDP2 尚未实现。前序
-[M2 Warmup 对比](m02_recipe/exp002_warmup/README.md)
-确定的基线仍为 LR=1e-3、warmup=300。
+最新报告：[M5：等算力对照与留出预算验证](m05_scaling/exp001_isoflop/README.md)。
+三档近似等算力预算中，39M / 547M、39M / 856M、99M / 1B tokens 的
+已测最低同集验证 loss 分别为 3.272709、3.209490、3.010837。
+213M base model 的独立评测见
+[M4 报告](m04_base/exp001_213m/README.md)。
 
 每份 README 只需要回答五个问题：
 

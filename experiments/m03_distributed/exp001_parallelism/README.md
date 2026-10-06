@@ -1,14 +1,13 @@
-# M3：单卡 / 双卡 DDP 一致性与性能
+# M3：单卡、DDP 与 FSDP2 一致性及性能
 
 ## 结论
 
-本实验已完成。固定全局 batch=16、seed=2026 和 1 epoch 预算，单卡与双卡
-DDP 均完成 3052 次更新、99,999,744 个输入 tokens。最终全量验证 loss 分别为
-**3.657353** 和 **3.657155**，相差 0.000198；两组的 32 个验证点均持续下降。
-双卡在相同区间的全局训练吞吐为单卡的约 **1.95 倍**，每卡 PyTorch allocated
-峰值显存高约 0.38 GiB。100→400→3052 的恢复和最终 checkpoint 严格加载均
-通过。40 步 Nsight 短程剖析也完成，稳定区间的更新耗时比约 1.94×；FSDP2
-和正式能力评测未开展。
+M3 已完成。固定全局 batch=16、seed=2026 和 99,999,744 个输入 tokens，
+单卡、双卡 DDP、双卡 FSDP2 均完成 3052 次更新；最终全量验证 loss 为
+**3.657353 / 3.657155 / 3.657209**。双卡 DDP 的稳态吞吐为单卡的 **1.95×**。
+同为双卡，FSDP2 比 DDP 每卡节省约 **0.82 GiB（9.1%）** 峰值显存，训练更新
+吞吐低 **7.2%**。DDP、FSDP2 的恢复与 checkpoint 严格加载通过；40 步
+Nsight 剖析已完成。213M 双卡短跑也通过，正式能力评测留到 M4。
 
 ## 目的与固定参数
 
@@ -20,13 +19,13 @@ BF16、AdamW、梯度裁剪阈值 1.0、1 epoch。完整计划仍为 3052 次更
 | 对照 | 进程 / GPU 数 | 每卡 micro-batch | 每卡累积次数 | 全局 batch |
 | --- | ---: | ---: | ---: | ---: |
 | 单卡 | 1 | 4 | 4 | 16 |
-| 双卡 DDP | 2 | 4 | 2 | 16 |
+| 双卡 DDP / FSDP2 | 2 | 4 | 2 | 16 |
 
-两组从相同 seed **重新初始化**，不加载 M2 最终模型。保持全局 batch、数据顺序、
+单卡和 DDP 从相同 seed **重新初始化**，不加载 M2 最终模型。保持全局 batch、数据顺序、
 更新次数和 LR 计划一致；卡数翻倍不代表 LR 要翻倍。先确认两张卡空闲，再开展性能比较，
 两组不要同时跑。
 
-## 操作顺序
+## DDP 操作顺序
 
 ### 1. 单卡对照：先跑 100 步
 
@@ -230,10 +229,74 @@ checkpoint 拒绝及真实 `torchrun` 入口；本轮补足 99M 双 GPU/NCCL/BF1
 PYTHONNOUSERSITE=1 python -m pytest tests/unit/training/test_pretrain_ddp.py -q
 ```
 
-完整预算的 DDP 对照与 Nsight 短程剖析均已完成。下一步若要完成 M3 的
-分片训练目标，应先实现 FSDP2，再在相同模型、数据、全局 batch 和训练预算下
-比较正确性、每卡显存、稳态吞吐及保存/恢复成本；当前还没有 FSDP2 训练入口。
+## FSDP2 完整预算与 213M 短跑
+
+FSDP2 沿用上面的 99M 模型、数据、seed、BF16 和优化器配置；每卡 batch=4、
+累积=2，从头跑到 step 100，再由分片 checkpoint 恢复至 3052。两次均用双卡：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 PYTHONNOUSERSITE=1 torchrun --standalone --nproc-per-node=2 \
+  scripts/train/pretrain_fsdp.py --device cuda --batch-size 4 --grad-accum-steps 2 \
+  --output-dir runs/m03_99m_fsdp2 --stop-after-steps 100
+CUDA_VISIBLE_DEVICES=0,1 PYTHONNOUSERSITE=1 torchrun --standalone --nproc-per-node=2 \
+  scripts/train/pretrain_fsdp.py --device cuda --batch-size 4 --grad-accum-steps 2 \
+  --resume runs/m03_99m_fsdp2/checkpoint
+```
+
+| 99M，完整预算 | DDP | FSDP2 |
+| --- | ---: | ---: |
+| 最终验证 loss | 3.657155 | 3.657209 |
+| 全局训练 tokens/s，step 402–3051 | 164,014 | 152,230 |
+| 每卡 allocated 峰值，rank 0 / 1，GiB | 9.032 / 9.022 | 8.208 / 8.208 |
+| 裁剪前梯度范数大于 1 的更新数 | 44 | 47 |
+
+两组的 LR、`tokens_seen` 逐步相同，均有 3052 条训练记录和 32 个验证点；
+最大验证 loss 差为 0.011577（step 300），最终差为 0.000054，没有持续分叉。
+吞吐按相同步数的总 tokens / 总更新耗时聚合，排除 DDP 恢复首步和 epoch 尾步；
+`summary.json` 的最后会话分别从 DDP step 400、FSDP2 step 100 开始，不能直接比
+`session_elapsed_seconds`。FSDP2 的分片 checkpoint 总计约 1.286 GB，DDP 单文件
+约 1.187 GB；分片节省的是每卡显存，不保证节省总磁盘。FSDP2 的 DCP 权重已
+在 CPU 加载进普通模型，严格匹配全部 key；导出的 `checkpoint_full.pt` 用现有
+推理脚本生成 1 个 token，输出 `,`。这仅验证加载和生成链路；新增的 4 项
+FSDP 单元测试也已通过。
+
+```bash
+PYTHONNOUSERSITE=1 python scripts/inference/pretrained_checkpoint_demo.py \
+  --checkpoint runs/m03_99m_fsdp2/checkpoint_full.pt --device cpu --precision fp32 \
+  --prompt 'The future of artificial intelligence' --max-new-tokens 1
+```
+
+在相同 100M 数据上另从头测试 213,156,864 参数的 `p213m.yaml`，双卡 BF16、
+全局 batch=16，分别跑 100 步；两组 step 0/100 的验证 loss 为
+10.571736→6.645140（DDP）及 10.571736→6.644761（FSDP2）。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 PYTHONNOUSERSITE=1 torchrun --standalone --nproc-per-node=2 \
+  scripts/train/pretrain_ddp.py --model-config configs/model/p213m.yaml \
+  --batch-size 4 --grad-accum-steps 2 --output-dir runs/m04_213m_ddp_pilot \
+  --stop-after-steps 100
+CUDA_VISIBLE_DEVICES=0,1 PYTHONNOUSERSITE=1 torchrun --standalone --nproc-per-node=2 \
+  scripts/train/pretrain_fsdp.py --model-config configs/model/p213m.yaml \
+  --batch-size 4 --grad-accum-steps 2 --output-dir runs/m04_213m_fsdp_pilot \
+  --stop-after-steps 100
+```
+
+| 213M，step 10–99 | DDP | FSDP2 |
+| --- | ---: | ---: |
+| 全局训练 tokens/s | 93,141 | 88,234 |
+| 每卡 allocated 峰值，GiB | 14.618 | 12.706 |
+
+DDP 快约 5.3%，FSDP2 每卡少用 1.912 GiB。DDP 第一步峰值约 12.975 GiB，
+第二步升至 14.618 GiB，此后不再增长：AdamW 两组状态在首次更新后常驻；
+反向所需的 16 层中间张量以及完整词表交叉熵是峰值的主要来源。当前两张 H20
+均能容纳 213M，因此 M4 首轮使用 DDP。这两次只检验系统与前 100 步稳定性，
+不将短跑 loss 当作最终模型质量，也不能把 100M 数据的 checkpoint 恢复到 M4
+新准备的 1B 数据。
+
+下一步在 M4 的 1B-token 数据上进行 213M 学习率对照、完整预算训练和独立能力评测。
 
 参考：[PyTorch DDP 与 no_sync](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html)、
+[FSDP2](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html)、
+[DCP](https://docs.pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html)、
 [torchrun 与 LOCAL_RANK](https://docs.pytorch.org/docs/stable/elastic/run.html)、
 [Nsight Systems 用户指南](https://docs.nvidia.com/nsight-systems/UserGuide/)。

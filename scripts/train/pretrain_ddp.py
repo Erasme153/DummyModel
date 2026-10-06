@@ -45,17 +45,19 @@ from scripts.train import pretrain as single  # noqa: E402
 from dummym.models.llama_like import MiniLlamaConfig, MiniLlamaForCausalLM  # noqa: E402
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
+def build_parser(description=None, *, device_help="cpu 或 cuda；torchrun 下由 LOCAL_RANK 绑定 GPU"):
+    parser = argparse.ArgumentParser(description=description or __doc__)
     parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data/tokenized/m01_fineweb_100m")
     parser.add_argument("--model-config", type=Path, default=PROJECT_ROOT / "configs/model/p099m.yaml")
     parser.add_argument("--output-dir", type=Path, help="新训练必须指定，已有目录拒绝覆盖")
     parser.add_argument("--resume", type=Path)
-    parser.add_argument("--device", default="cuda", help="cpu 或 cuda；torchrun 下由 LOCAL_RANK 绑定 GPU")
+    parser.add_argument("--device", default="cuda", help=device_help)
     parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--batch-size", type=int, default=4, help="每个 rank 的 micro-batch 序列数")
     parser.add_argument("--grad-accum-steps", type=int, default=2, help="每个 rank 的累积次数；双卡 2，单卡对照 4")
     parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--train-sequences", type=int,
+                        help="每轮仅训练 train.bin 的前 N 条序列，并在这 N 条内打乱；默认使用全部")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--warmup-steps", type=int, default=300)
@@ -71,6 +73,11 @@ def parse_args():
     parser.add_argument("--stop-after-steps", type=int, help="暂停的总更新步数，不改变完整 LR 计划")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--cpu-threads", type=int, default=4, help="每个 rank 的 CPU 线程数")
+    return parser
+
+
+def parse_args(parser=None):
+    parser = parser or build_parser()
     args = parser.parse_args()
     for name in ("batch_size", "grad_accum_steps", "epochs", "eval_every", "save_every", "log_every", "cpu_threads"):
         if getattr(args, name) <= 0:
@@ -86,6 +93,8 @@ def parse_args():
         parser.error("warmup-steps、eval-batches、seed 不能为负数")
     if args.stop_after_steps is not None and args.stop_after_steps <= 0:
         parser.error("stop-after-steps 必须为正数")
+    if args.train_sequences is not None and args.train_sequences <= 0:
+        parser.error("train-sequences 必须为正数")
     if args.output_dir is None and args.resume is None:
         parser.error("新训练必须指定 --output-dir")
     return args
@@ -268,7 +277,10 @@ def run(args, ctx):
     config = MiniLlamaConfig.from_dict(yaml.safe_load(args.model_config.read_text())["model_config"])
     datasets, fingerprint, tokenizer_path = single.load_data(args.data_dir, config)
     sequence_length = fingerprint["sequence_length"]
-    rows = len(datasets["train"])
+    available_rows = len(datasets["train"])
+    if args.train_sequences is not None and args.train_sequences > available_rows:
+        raise ValueError(f"train-sequences={args.train_sequences} 超过训练集序列数 {available_rows}")
+    rows = available_rows if args.train_sequences is None else args.train_sequences
     global_batch = args.batch_size * args.grad_accum_steps * ctx.world_size
     total_steps = math.ceil(rows / global_batch) * args.epochs
     if args.warmup_steps >= total_steps:
@@ -280,6 +292,9 @@ def run(args, ctx):
                 "recipe": {name: getattr(args, name) for name in recipe_names},
                 "world_size": ctx.world_size, "global_batch": global_batch,
                 "device_type": ctx.device.type, "total_steps": total_steps}
+    # 默认模式保持原 checkpoint contract 不变；显式限制训练集时把范围纳入恢复约定。
+    if args.train_sequences is not None:
+        contract["recipe"]["train_sequences"] = args.train_sequences
     # 也核对 rank 间的数据与命令行，防止同名文件在不同挂载点下内容不同。
     if ctx.distributed:
         contracts = [None] * ctx.world_size

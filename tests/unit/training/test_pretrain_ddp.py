@@ -121,7 +121,8 @@ def resume_worker(rank, rendezvous, directory):
         base = ["pretrain_ddp.py", "--data-dir", str(root / "data"),
                 "--model-config", str(root / "model.yaml"), "--device", "cpu",
                 "--precision", "fp32", "--batch-size", "2", "--grad-accum-steps", "1",
-                "--epochs", "2", "--warmup-steps", "1", "--eval-every", "2", "--save-every", "2"]
+                "--epochs", "2", "--train-sequences", "5", "--warmup-steps", "1",
+                "--eval-every", "2", "--save-every", "2"]
         for name, extra in (("full", []), ("resumed", ["--stop-after-steps", "1"]),
                             ("resumed", ["--resume", str(root / "resumed/checkpoint.pt")])):
             sys.argv = base + ["--output-dir", str(root / name)] + extra
@@ -132,14 +133,19 @@ def resume_worker(rank, rendezvous, directory):
         for key in ("model_state_dict", "optimizer_state_dict", "scheduler_state_dict",
                     "progress", "rng_states"):
             assert_identical(full[key], resumed[key])
-        assert resumed["progress"]["tokens_seen"] == 7 * 8 * 2
+        assert resumed["progress"]["tokens_seen"] == 5 * 8 * 2
         assert resumed["progress"]["step"] == 4
         assert resumed["progress"]["next_sequence"] == 0
+        assert resumed["contract"]["recipe"]["train_sequences"] == 5
         # 推理脚本使用未包 DDP 的模型；不能让 checkpoint 权重带 module. 前缀。
         loaded = trainer.MiniLlamaForCausalLM(small_config(0.1))
         loaded.load_state_dict(resumed["model_state_dict"], strict=True)
         wrong = copy.deepcopy(resumed["contract"])
         wrong["world_size"] = 1
+        with pytest.raises(ValueError, match="训练约定"):
+            trainer.load_resume(root / "resumed/checkpoint.pt", wrong, ctx)
+        wrong = copy.deepcopy(resumed["contract"])
+        wrong["recipe"]["train_sequences"] = 6
         with pytest.raises(ValueError, match="训练约定"):
             trainer.load_resume(root / "resumed/checkpoint.pt", wrong, ctx)
     finally:
