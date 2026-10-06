@@ -59,6 +59,17 @@ def build_parser(description=None, *, device_help="cpu 或 cuda；torchrun 下�
     parser.add_argument("--train-sequences", type=int,
                         help="每轮仅训练 train.bin 的前 N 条序列，并在这 N 条内打乱；默认使用全部")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--optimizer", choices=("adamw", "muon", "muonh", "adamh"), default="adamw")
+    parser.add_argument("--muon-lr", type=float,
+                        help="Muon 隐藏层矩阵的峰值学习率，默认 0.02")
+    parser.add_argument("--adamw-lr", type=float,
+                        help="混合优化器中 embedding/head/norm 的 AdamW 峰值学习率；默认沿用 --learning-rate")
+    parser.add_argument("--hyperball-lr", type=float,
+                        help="MuonH/AdamH 隐藏层矩阵的峰值相对更新长度；必须显式指定")
+    parser.add_argument("--muon-momentum", type=float, help="Muon 动量，默认 0.95")
+    parser.add_argument("--muon-ns-steps", type=int, help="Newton-Schulz 迭代次数，默认 5")
+    parser.add_argument("--record-update-norms", action="store_true",
+                        help="按 --log-every 记录参数、实际更新范数及其比值；Muon 入口默认启用")
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--warmup-steps", type=int, default=300)
     parser.add_argument("--weight-decay", type=float, default=0.1)
@@ -95,6 +106,30 @@ def parse_args(parser=None):
         parser.error("stop-after-steps 必须为正数")
     if args.train_sequences is not None and args.train_sequences <= 0:
         parser.error("train-sequences 必须为正数")
+    if args.adamw_lr is not None and (not math.isfinite(args.adamw_lr) or args.adamw_lr <= 0):
+        parser.error("adamw-lr 必须为有限正数")
+    if args.optimizer in ("muon", "muonh"):
+        if args.optimizer == "muon":
+            args.muon_lr = 0.02 if args.muon_lr is None else args.muon_lr
+        args.muon_momentum = 0.95 if args.muon_momentum is None else args.muon_momentum
+        args.muon_ns_steps = 5 if args.muon_ns_steps is None else args.muon_ns_steps
+        if args.optimizer == "muon" and (not math.isfinite(args.muon_lr) or args.muon_lr <= 0):
+            parser.error("muon-lr 必须为有限正数")
+        if not math.isfinite(args.muon_momentum) or not 0 <= args.muon_momentum < 1:
+            parser.error("muon-momentum 必须在 [0,1) 内")
+        if args.muon_ns_steps <= 0:
+            parser.error("muon-ns-steps 必须为正数")
+        if args.optimizer == "muonh" and args.muon_lr is not None:
+            parser.error("MuonH 使用 --hyperball-lr，不使用 --muon-lr")
+    elif any(value is not None for value in (args.muon_lr, args.muon_momentum, args.muon_ns_steps)):
+        parser.error("Muon 专用参数只在 --optimizer muon/muonh 时生效")
+    if args.optimizer in ("muonh", "adamh"):
+        if args.hyperball_lr is None or not math.isfinite(args.hyperball_lr) or args.hyperball_lr <= 0:
+            parser.error("MuonH/AdamH 必须指定有限正数 --hyperball-lr")
+    elif args.hyperball_lr is not None:
+        parser.error("--hyperball-lr 只在 MuonH/AdamH 模式生效")
+    if args.optimizer == "adamw" and args.adamw_lr is not None:
+        parser.error("AdamW 模式使用 --learning-rate，不使用 --adamw-lr")
     if args.output_dir is None and args.resume is None:
         parser.error("新训练必须指定 --output-dir")
     return args
@@ -161,7 +196,127 @@ def rank_zero_call(ctx, action):
         raise RuntimeError(f"rank 0 操作失败：{error[0]}")
 
 
-def train_update(model, optimizer, dataset, global_indices, args, ctx):
+def _orthogonalize_muon(update: torch.Tensor, steps: int) -> torch.Tensor:
+    """原始 Muon 的五次多项式 Newton-Schulz 近似；CPU 测试使用 FP32。"""
+    # 公式与矩阵形状缩放参照 https://github.com/KellerJordan/Muon (MIT)。
+    x = update.to(torch.bfloat16 if update.is_cuda and torch.cuda.is_bf16_supported()
+                  else torch.float32)
+    transposed = x.shape[0] > x.shape[1]
+    if transposed:
+        x = x.T
+    x = x / (x.norm() + 1e-7)
+    for _ in range(steps):
+        a = x @ x.T
+        b = -4.7750 * a + 2.0315 * (a @ a)
+        x = 3.4445 * x + b @ x
+    if transposed:
+        x = x.T
+    x = x * max(1.0, update.shape[0] / update.shape[1]) ** 0.5
+    return x.to(update.dtype)
+
+
+def split_hidden_and_aux_parameters(model):
+    """Transformer 二维矩阵与其余参数互斥分组，排除共享 embedding/head。"""
+    hidden, aux_decay, aux_no_decay = [], [], []
+    embedding_id = id(model.embed_tokens.weight)
+    head_id = id(model.lm_head.weight)
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("layers.") and parameter.ndim == 2 and id(parameter) not in (embedding_id, head_id):
+            hidden.append(parameter)
+        elif parameter.ndim >= 2:
+            aux_decay.append(parameter)
+        else:
+            aux_no_decay.append(parameter)
+    if not hidden:
+        raise ValueError("Muon/Hyperball 需要至少一个 Transformer 隐藏层二维参数")
+    registered = [*hidden, *aux_decay, *aux_no_decay]
+    expected = [p for p in model.parameters() if p.requires_grad]
+    if len(registered) != len(expected) or {id(p) for p in registered} != {id(p) for p in expected}:
+        raise RuntimeError("优化器参数分组存在重复或遗漏")
+    return hidden, aux_decay, aux_no_decay
+
+
+class MuonWithAuxAdamW(torch.optim.Optimizer):
+    """隐藏层二维权重用 Muon，其余参数用 AdamW；共享参数只注册一次。"""
+
+    def __init__(self, model, args):
+        hidden, aux_decay, aux_no_decay = split_hidden_and_aux_parameters(model)
+        adamw_lr = args.adamw_lr if args.adamw_lr is not None else args.learning_rate
+        groups = [
+            {"params": hidden, "use_muon": True, "lr": args.muon_lr,
+             "momentum": args.muon_momentum, "ns_steps": args.muon_ns_steps,
+             "weight_decay": args.weight_decay},
+            {"params": aux_decay, "use_muon": False, "lr": adamw_lr,
+             "betas": (args.beta1, args.beta2), "eps": 1e-8, "weight_decay": args.weight_decay},
+            {"params": aux_no_decay, "use_muon": False, "lr": adamw_lr,
+             "betas": (args.beta1, args.beta2), "eps": 1e-8, "weight_decay": 0.0},
+        ]
+        super().__init__(groups, defaults={})
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            for parameter in group["params"]:
+                grad = parameter.grad
+                if grad is None:
+                    continue
+                state = self.state[parameter]
+                if group["use_muon"]:
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(parameter)
+                    momentum = state["momentum_buffer"]
+                    momentum.lerp_(grad, 1 - group["momentum"])
+                    direction = grad.lerp(momentum, group["momentum"])
+                    update = _orthogonalize_muon(direction, group["ns_steps"])
+                    parameter.mul_(1 - group["lr"] * group["weight_decay"])
+                    parameter.add_(update, alpha=-group["lr"])
+                else:
+                    if "exp_avg" not in state:
+                        state["exp_avg"] = torch.zeros_like(parameter)
+                        state["exp_avg_sq"] = torch.zeros_like(parameter)
+                        state["step"] = 0
+                    state["step"] += 1
+                    beta1, beta2 = group["betas"]
+                    state["exp_avg"].lerp_(grad, 1 - beta1)
+                    state["exp_avg_sq"].mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                    denominator = state["exp_avg_sq"].sqrt() / math.sqrt(1 - beta2 ** state["step"])
+                    denominator.add_(group["eps"])
+                    parameter.mul_(1 - group["lr"] * group["weight_decay"])
+                    parameter.addcdiv_(state["exp_avg"], denominator,
+                                        value=-group["lr"] / (1 - beta1 ** state["step"]))
+        return loss
+
+
+@torch.no_grad()
+def _record_update_norms(before, output):
+    """记录参数更新后的 L2 范数，以及包含 weight decay 的实际参数位移。"""
+    sums = {}
+    for kind, parameter, previous in before:
+        if kind not in sums:
+            zero = torch.zeros((), dtype=torch.float64, device=parameter.device)
+            sums[kind] = [zero.clone(), zero.clone()]
+        sums[kind][0] += parameter.detach().square().sum(dtype=torch.float64)
+        sums[kind][1] += (parameter.detach() - previous).square().sum(dtype=torch.float64)
+    all_parameters = sum((pair[0] for pair in sums.values()))
+    all_updates = sum((pair[1] for pair in sums.values()))
+    for name, parameter_sq, update_sq in [
+        ("", all_parameters, all_updates),
+        *((f"{kind}_", values[0], values[1]) for kind, values in sums.items()),
+    ]:
+        parameter_norm = math.sqrt(parameter_sq.item())
+        update_norm = math.sqrt(update_sq.item())
+        output[f"{name}parameter_norm"] = parameter_norm
+        output[f"{name}update_norm"] = update_norm
+        output[f"{name}update_to_parameter_ratio"] = update_norm / parameter_norm if parameter_norm else 0.0
+
+
+def train_update(model, optimizer, dataset, global_indices, args, ctx, norm_metrics=None):
     """同一全局 batch 先分给 rank，再在每个 rank 内做 micro-batch 累积。
 
     标准 DDP 默认对各 rank 梯度取平均。若全局有 N 条样本，本地某个
@@ -200,7 +355,14 @@ def train_update(model, optimizer, dataset, global_indices, args, ctx):
         raise RuntimeError("训练 loss 出现 NaN/Inf，停止更新")
     # 此时最后一次 backward 已同步整个累积梯度；先同步再裁剪，不能各卡先裁剪。
     norm = clip_grad_norm_(model.parameters(), args.max_grad_norm, error_if_nonfinite=True)
+    before = None
+    if norm_metrics is not None:
+        before = [(group.get("norm_kind", "muon" if group.get("use_muon") else "adamw"), parameter,
+                   parameter.detach().clone())
+                  for group in optimizer.param_groups for parameter in group["params"]]
     optimizer.step()
+    if before is not None:
+        _record_update_norms(before, norm_metrics)
     return total.item() / count, float(norm)
 
 
@@ -295,6 +457,18 @@ def run(args, ctx):
     # 默认模式保持原 checkpoint contract 不变；显式限制训练集时把范围纳入恢复约定。
     if args.train_sequences is not None:
         contract["recipe"]["train_sequences"] = args.train_sequences
+    if args.optimizer == "muon":
+        contract["recipe"].update({"optimizer": "muon", "muon_lr": args.muon_lr,
+                                   "adamw_lr": args.adamw_lr if args.adamw_lr is not None else args.learning_rate,
+                                   "muon_momentum": args.muon_momentum,
+                                   "muon_ns_steps": args.muon_ns_steps})
+    elif args.optimizer in ("muonh", "adamh"):
+        contract["recipe"].update({"optimizer": args.optimizer,
+                                   "hyperball_lr": args.hyperball_lr,
+                                   "adamw_lr": args.adamw_lr if args.adamw_lr is not None else args.learning_rate})
+        if args.optimizer == "muonh":
+            contract["recipe"].update({"muon_momentum": args.muon_momentum,
+                                       "muon_ns_steps": args.muon_ns_steps})
     # 也核对 rank 间的数据与命令行，防止同名文件在不同挂载点下内容不同。
     if ctx.distributed:
         contracts = [None] * ctx.world_size
@@ -306,7 +480,13 @@ def run(args, ctx):
     # 先用相同 seed 初始化。DDP 构造时还会从 rank 0 同步权重，确保一致起点。
     torch.manual_seed(args.seed)
     raw_model = MiniLlamaForCausalLM(config).to(ctx.device)
-    optimizer = single.make_optimizer(raw_model, args)
+    if args.optimizer == "muon":
+        optimizer = MuonWithAuxAdamW(raw_model, args)
+    elif args.optimizer in ("muonh", "adamh"):
+        from scripts.train.pretrain_hyperball import HyperballWithAuxAdamW
+        optimizer = HyperballWithAuxAdamW(raw_model, args)
+    else:
+        optimizer = single.make_optimizer(raw_model, args)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=lambda i: single.lr_factor(i, total_steps, args.warmup_steps, args.min_lr_ratio))
     progress = {"step": 0, "epoch": 0, "next_sequence": 0, "tokens_seen": 0,
@@ -326,7 +506,7 @@ def run(args, ctx):
     if ctx.distributed:
         # RoPE buffer 是固定频率，各 rank 构造相同；无须每次 forward 广播。
         # 当前所有可训练参数都参与 loss，不启用 find_unused_parameters。
-        # 各 rank 独立执行相同 AdamW 更新；DDP 不是每步把 rank 0 权重复制过来，
+        # 各 rank 独立执行相同优化器更新；DDP 不是每步把 rank 0 权重复制过来，
         # 而是在 backward 中同步梯度，使同起点、同优化器的各副本保持相同参数。
         model = DDP(raw_model, device_ids=[ctx.device.index] if ctx.device.type == "cuda" else None,
                     broadcast_buffers=False)
@@ -354,7 +534,7 @@ def run(args, ctx):
         if ctx.rank == 0:
             print(f"parameters={raw_model.num_parameters():,} world_size={ctx.world_size} "
                   f"global_batch={global_batch} total_steps={total_steps} start_step={start_step} "
-                  f"stop_step={stop_step} precision={args.precision}", flush=True)
+                  f"stop_step={stop_step} precision={args.precision} optimizer={args.optimizer}", flush=True)
 
         def validate():
             loss, count = evaluate(model, datasets["validation"], args, ctx)
@@ -387,7 +567,13 @@ def run(args, ctx):
             if ctx.distributed:
                 dist.barrier()
             learning_rate = optimizer.param_groups[0]["lr"]
-            loss, norm = train_update(model, optimizer, datasets["train"], indices, args, ctx)
+            adamw_learning_rate = (optimizer.param_groups[1]["lr"]
+                                   if args.optimizer in ("muon", "muonh", "adamh") else None)
+            next_step = progress["step"] + 1
+            norm_metrics = ({} if args.record_update_norms and
+                            (next_step == 1 or next_step % args.log_every == 0 or next_step == stop_step)
+                            else None)
+            loss, norm = train_update(model, optimizer, datasets["train"], indices, args, ctx, norm_metrics)
             scheduler.step()
             if ctx.device.type == "cuda":
                 torch.cuda.synchronize(ctx.device)
@@ -407,6 +593,11 @@ def run(args, ctx):
             metrics = {"loss": loss, "learning_rate": learning_rate, "gradient_norm": norm,
                        "tokens_seen": progress["tokens_seen"],
                        "tokens_per_second": len(indices) * sequence_length / elapsed.item()}
+            if args.optimizer in ("muon", "muonh", "adamh"):
+                metrics[f"{args.optimizer}_learning_rate"] = learning_rate
+                metrics["adamw_learning_rate"] = adamw_learning_rate
+            if norm_metrics is not None:
+                metrics.update(norm_metrics)
             if ctx.device.type == "cuda":
                 memory = torch.tensor(torch.cuda.max_memory_allocated(ctx.device) / 1024**3, device=ctx.device)
                 memories = [torch.zeros_like(memory) for _ in range(ctx.world_size)]
@@ -450,8 +641,8 @@ def run(args, ctx):
             writer.close()
 
 
-def main():
-    args = parse_args()
+def main(args=None):
+    args = parse_args() if args is None else args
     torch.set_num_threads(args.cpu_threads)
     ctx = setup_distributed(args.device)
     try:

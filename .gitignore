@@ -17,6 +17,7 @@ data/processed/**
 data/tokenized/**
 data/packed/**
 runs/**
+tmp/**
 
 # Notebooks
 .ipynb_checkpoints/

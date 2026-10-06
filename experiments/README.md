@@ -22,14 +22,17 @@ experiments/
 ├── m04_base/
 │   └── exp001_213m/
 │       └── README.md
-└── m05_scaling/
-    └── exp001_isoflop/
+├── m05_scaling/
+│   └── exp001_isoflop/
+│       └── README.md
+└── m06_optimizer/
+    └── exp001_muon_hyperball/
         └── README.md
 ```
 
-最新报告：[M5：等算力对照与留出预算验证](m05_scaling/exp001_isoflop/README.md)。
-三档近似等算力预算中，39M / 547M、39M / 856M、99M / 1B tokens 的
-已测最低同集验证 loss 分别为 3.272709、3.209490、3.010837。
+最新报告：[M6：Muon、MuonH 与 AdamH](m06_optimizer/exp001_muon_hyperball/README.md)。
+99M / 100M-token 对照中，MuonW 的独立验证 loss 为 3.405980，
+MuonH、AdamH 各自最佳结果为 3.414223、3.605910。
 213M base model 的独立评测见
 [M4 报告](m04_base/exp001_213m/README.md)。
 

@@ -51,6 +51,8 @@ def parse_args():
     args = ddp.parse_args(parser)
     if args.train_sequences is not None:
         parser.error("--train-sequences 目前仅 DDP 入口支持")
+    if args.optimizer != "adamw" or args.record_update_norms:
+        parser.error("FSDP2 入口暂不支持 Muon/Hyperball 或更新范数记录；请使用 DDP 入口")
     return args
 
 
