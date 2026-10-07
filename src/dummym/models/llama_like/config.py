@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 from typing import Any
 
 
@@ -29,6 +30,11 @@ class MiniLlamaConfig:
     pad_token_id: int | None = None
     bos_token_id: int | None = None
     eos_token_id: int | None = None
+    num_experts: int = 0
+    experts_per_token: int = 2
+    expert_intermediate_size: int | None = None
+    capacity_factor: float | None = None
+    moe_routing: str = "topk"
 
     def __post_init__(self) -> None:
         positive_int_fields = (
@@ -62,6 +68,22 @@ class MiniLlamaConfig:
             raise ValueError("rms_norm_eps must be positive")
         if self.initializer_range <= 0:
             raise ValueError("initializer_range must be positive")
+        if self.num_experts < 0 or (self.num_experts and self.experts_per_token > self.num_experts):
+            raise ValueError("num_experts must be >= experts_per_token, or zero for dense")
+        if self.experts_per_token <= 0:
+            raise ValueError("experts_per_token must be positive")
+        if self.expert_intermediate_size is not None and self.expert_intermediate_size <= 0:
+            raise ValueError("expert_intermediate_size must be positive")
+        if self.capacity_factor is not None and (
+            not self.num_experts or not math.isfinite(self.capacity_factor) or self.capacity_factor <= 0
+        ):
+            raise ValueError("capacity_factor requires MoE and must be finite and positive")
+        if self.moe_routing not in ("topk", "qb"):
+            raise ValueError("moe_routing must be topk or qb")
+        if self.moe_routing == "qb" and (not self.num_experts or self.experts_per_token >= self.num_experts):
+            raise ValueError("QB requires 0 < experts_per_token < num_experts")
+        if self.moe_routing == "qb" and self.capacity_factor is not None:
+            raise ValueError("QB currently requires no capacity limit")
 
     @property
     def head_dim(self) -> int:
@@ -72,7 +94,16 @@ class MiniLlamaConfig:
         return self.num_attention_heads // self.num_key_value_heads
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        values = asdict(self)
+        # Preserve the v1 dense checkpoint contract when MoE is disabled.
+        if not self.num_experts:
+            for name in ("num_experts", "experts_per_token", "expert_intermediate_size", "capacity_factor",
+                         "moe_routing"):
+                values.pop(name)
+        elif self.moe_routing == "topk":
+            # Older MoE checkpoint contracts did not include this default.
+            values.pop("moe_routing")
+        return values
 
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> "MiniLlamaConfig":

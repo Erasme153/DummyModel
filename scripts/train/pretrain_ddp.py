@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M3 单机单卡/多卡预训练：理解 DDP 的数据划分、梯度平均与恢复。
+"""单机单卡/多卡 DDP 预训练，支持 dense 与本地 top-k MoE。
 
 双卡启动：torchrun --standalone --nproc_per_node=2 scripts/train/pretrain_ddp.py ...
 单卡启动：python scripts/train/pretrain_ddp.py --grad-accum-steps 4 ...
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 import json
 import math
@@ -60,6 +60,13 @@ def build_parser(description=None, *, device_help="cpu 或 cuda；torchrun 下�
                         help="每轮仅训练 train.bin 的前 N 条序列，并在这 N 条内打乱；默认使用全部")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--optimizer", choices=("adamw", "muon", "muonh", "adamh"), default="adamw")
+    parser.add_argument("--moe-aux-loss-coef", type=float,
+                        help="MoE 路由负载均衡损失系数；MoE 默认 0.01，设为 0 可做消融")
+    parser.add_argument("--moe-routing", choices=("topk", "qb"),
+                        help="覆盖模型配置的 MoE 路由；QB 用分位数偏置，且 aux loss 必须为 0")
+    parser.add_argument("--moe-top-k", type=int, help="覆盖模型配置中的每 token 专家数")
+    parser.add_argument("--moe-capacity-factor", type=float,
+                        help="覆盖模型配置中的专家容量系数；默认不设容量、不丢路由")
     parser.add_argument("--muon-lr", type=float,
                         help="Muon 隐藏层矩阵的峰值学习率，默认 0.02")
     parser.add_argument("--adamw-lr", type=float,
@@ -132,6 +139,14 @@ def parse_args(parser=None):
         parser.error("AdamW 模式使用 --learning-rate，不使用 --adamw-lr")
     if args.output_dir is None and args.resume is None:
         parser.error("新训练必须指定 --output-dir")
+    if args.moe_aux_loss_coef is not None and (not math.isfinite(args.moe_aux_loss_coef)
+                                               or args.moe_aux_loss_coef < 0):
+        parser.error("moe-aux-loss-coef 必须为有限非负数")
+    if args.moe_top_k is not None and args.moe_top_k <= 0:
+        parser.error("moe-top-k 必须为正数")
+    if args.moe_capacity_factor is not None and (not math.isfinite(args.moe_capacity_factor)
+                                                 or args.moe_capacity_factor <= 0):
+        parser.error("moe-capacity-factor 必须为有限正数")
     return args
 
 
@@ -316,7 +331,8 @@ def _record_update_norms(before, output):
         output[f"{name}update_to_parameter_ratio"] = update_norm / parameter_norm if parameter_norm else 0.0
 
 
-def train_update(model, optimizer, dataset, global_indices, args, ctx, norm_metrics=None):
+def train_update(model, optimizer, dataset, global_indices, args, ctx, norm_metrics=None,
+                 routing_metrics=None):
     """同一全局 batch 先分给 rank，再在每个 rank 内做 micro-batch 累积。
 
     标准 DDP 默认对各 rank 梯度取平均。若全局有 N 条样本，本地某个
@@ -334,6 +350,12 @@ def train_update(model, optimizer, dataset, global_indices, args, ctx, norm_metr
     rounds = math.ceil(math.ceil(count / ctx.world_size) / args.batch_size)
     optimizer.zero_grad(set_to_none=True)
     local_loss_sum = 0.0
+    router_sums = None
+    router_sequences = 0
+    raw_model = unwrap(model)
+    qb_enabled = raw_model.config.num_experts and raw_model.config.moe_routing == "qb"
+    qb_beta_sum = None
+    qb_sequences = 0
     for index in range(rounds):
         part = local_indices[index * args.batch_size:(index + 1) * args.batch_size]
         batch = dataset.batch(part if len(part) else global_indices[:1], ctx.device)
@@ -341,11 +363,35 @@ def train_update(model, optimizer, dataset, global_indices, args, ctx, norm_metr
         # no_sync 必须同时包住 forward 和 backward，只包 backward 不足以关闭同步。
         with sync_context:
             with single.precision_context(ctx.device, args.precision):
-                loss = model(input_ids=batch, labels=batch).loss
+                output = model(input_ids=batch, labels=batch)
+            loss = output.loss
             if loss is None:
                 raise RuntimeError("模型没有返回 causal LM loss")
-            (loss * (ctx.world_size * len(part) / count)).backward()
+            objective = loss
+            aux_coef = getattr(args, "moe_aux_loss_coef", 0.0)
+            if output.aux_loss is not None and aux_coef:
+                objective = objective + aux_coef * output.aux_loss
+            (objective * (ctx.world_size * len(part) / count)).backward()
         local_loss_sum += loss.detach().item() * len(part)
+        if qb_enabled and len(part):
+            candidate = output.router_stats["qb_beta_candidate"]
+            if qb_beta_sum is None:
+                qb_beta_sum = torch.zeros_like(candidate, dtype=torch.float64)
+            qb_beta_sum += candidate.detach().double() * len(part)
+            qb_sequences += len(part)
+        if routing_metrics is not None and len(part):
+            stats = output.router_stats
+            if stats is None or output.aux_loss is None:
+                raise RuntimeError("MoE 训练缺少路由统计")
+            if router_sums is None:
+                router_sums = {name: torch.zeros_like(value, dtype=torch.float64)
+                               for name, value in stats.items()}
+                router_sums["aux_loss"] = torch.zeros((), dtype=torch.float64, device=ctx.device)
+            for name in ("selected_counts", "kept_counts", "dropped_tokens"):
+                router_sums[name] += stats[name].detach().double()
+            router_sums["router_entropy"] += stats["router_entropy"].detach().double() * len(part)
+            router_sums["aux_loss"] += output.aux_loss.detach().double() * len(part)
+            router_sequences += len(part)
 
     total = torch.tensor(local_loss_sum, dtype=torch.float64, device=ctx.device)
     if ctx.distributed:
@@ -361,8 +407,63 @@ def train_update(model, optimizer, dataset, global_indices, args, ctx, norm_metr
                    parameter.detach().clone())
                   for group in optimizer.param_groups for parameter in group["params"]]
     optimizer.step()
+    if qb_enabled:
+        # 每个 micro-batch 独立估计分位数；按真实序列数汇总，再跨 rank
+        # 平均一次。空尾部 rank 不贡献候选，所有副本得到相同的下一步偏置。
+        layers, experts = raw_model.config.num_hidden_layers, raw_model.config.num_experts
+        if qb_beta_sum is None:
+            qb_beta_sum = torch.zeros((layers, experts), dtype=torch.float64, device=ctx.device)
+        packed_beta = torch.cat((qb_beta_sum.reshape(-1),
+                                 torch.tensor([qb_sequences], dtype=torch.float64, device=ctx.device)))
+        if ctx.distributed:
+            dist.all_reduce(packed_beta, op=dist.ReduceOp.SUM)
+        if packed_beta[-1].item() <= 0:
+            raise RuntimeError("QB 全局 batch 没有真实样本")
+        next_beta = (packed_beta[:-1] / packed_beta[-1]).reshape(layers, experts)
+        if not torch.isfinite(next_beta).all().item():
+            raise RuntimeError("QB 偏置更新出现 NaN/Inf")
+        with torch.no_grad():
+            for layer, beta in zip(raw_model.layers, next_beta):
+                layer.mlp.qb_beta.copy_(beta)
     if before is not None:
         _record_update_norms(before, norm_metrics)
+    if routing_metrics is not None:
+        raw = unwrap(model)
+        layers, experts = raw.config.num_hidden_layers, raw.config.num_experts
+        if router_sums is None:
+            router_sums = {
+                "selected_counts": torch.zeros((layers, experts), dtype=torch.float64, device=ctx.device),
+                "kept_counts": torch.zeros((layers, experts), dtype=torch.float64, device=ctx.device),
+                "dropped_tokens": torch.zeros(layers, dtype=torch.float64, device=ctx.device),
+                "router_entropy": torch.zeros(layers, dtype=torch.float64, device=ctx.device),
+                "aux_loss": torch.zeros((), dtype=torch.float64, device=ctx.device),
+            }
+        packed = torch.cat((*(router_sums[name].reshape(-1) for name in
+                              ("selected_counts", "kept_counts", "dropped_tokens",
+                               "router_entropy", "aux_loss")),
+                            torch.tensor([router_sequences], dtype=torch.float64, device=ctx.device)))
+        if ctx.distributed:
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        selected = packed[:layers * experts].reshape(layers, experts)
+        kept = packed[layers * experts:2 * layers * experts].reshape(layers, experts)
+        dropped = packed[2 * layers * experts:2 * layers * experts + layers]
+        entropy = packed[2 * layers * experts + layers:2 * layers * experts + 2 * layers]
+        aux, sequences = packed[-2:].tolist()
+        routing_metrics["router_aux_loss"] = aux / sequences
+        routing_metrics["router_dropped_assignment_fraction"] = 1 - (kept.sum() / selected.sum()).item()
+        routing_metrics["router_dropped_token_fraction"] = (
+            dropped.sum() / (sequences * dataset.rows.shape[1] * layers)).item()
+        routing_metrics["router_entropy"] = (entropy.sum() / (sequences * layers)).item()
+        for layer in range(layers):
+            for expert in range(experts):
+                routing_metrics[f"router/layer{layer}/expert{expert}_selected_fraction"] = (
+                    selected[layer, expert] / selected[layer].sum()).item()
+                routing_metrics[f"router/layer{layer}/expert{expert}_kept_fraction"] = (
+                    kept[layer, expert] / kept[layer].sum().clamp_min(1)).item()
+        if qb_enabled:
+            all_beta = torch.stack([layer.mlp.qb_beta for layer in raw_model.layers])
+            routing_metrics["router_qb_bias_min"] = all_beta.min().item()
+            routing_metrics["router_qb_bias_max"] = all_beta.max().item()
     return total.item() / count, float(norm)
 
 
@@ -437,6 +538,23 @@ def run(args, ctx):
     if args.precision == "bf16" and (ctx.device.type != "cuda" or not torch.cuda.is_bf16_supported()):
         raise ValueError("BF16 需要支持它的 CUDA GPU；CPU 测试使用 --precision fp32")
     config = MiniLlamaConfig.from_dict(yaml.safe_load(args.model_config.read_text())["model_config"])
+    if args.moe_top_k is not None or args.moe_capacity_factor is not None or args.moe_routing is not None:
+        if not config.num_experts:
+            raise ValueError("MoE 路由参数需要 num_experts > 0 的模型配置")
+        config = replace(config,
+                         experts_per_token=args.moe_top_k or config.experts_per_token,
+                         capacity_factor=(args.moe_capacity_factor if args.moe_capacity_factor is not None
+                                          else config.capacity_factor),
+                         moe_routing=args.moe_routing or config.moe_routing)
+    if config.num_experts:
+        if args.optimizer != "adamw":
+            raise ValueError("首版 MoE 仅支持 AdamW；先隔离路由与优化器变量")
+        args.moe_aux_loss_coef = ((0.0 if config.moe_routing == "qb" else 0.01)
+                                  if args.moe_aux_loss_coef is None else args.moe_aux_loss_coef)
+        if config.moe_routing == "qb" and args.moe_aux_loss_coef != 0:
+            raise ValueError("QB 使用分位数偏置平衡负载，--moe-aux-loss-coef 必须为 0")
+    elif args.moe_aux_loss_coef is not None:
+        raise ValueError("moe-aux-loss-coef 需要 num_experts > 0 的模型配置")
     datasets, fingerprint, tokenizer_path = single.load_data(args.data_dir, config)
     sequence_length = fingerprint["sequence_length"]
     available_rows = len(datasets["train"])
@@ -457,6 +575,8 @@ def run(args, ctx):
     # 默认模式保持原 checkpoint contract 不变；显式限制训练集时把范围纳入恢复约定。
     if args.train_sequences is not None:
         contract["recipe"]["train_sequences"] = args.train_sequences
+    if config.num_experts:
+        contract["recipe"]["moe_aux_loss_coef"] = args.moe_aux_loss_coef
     if args.optimizer == "muon":
         contract["recipe"].update({"optimizer": "muon", "muon_lr": args.muon_lr,
                                    "adamw_lr": args.adamw_lr if args.adamw_lr is not None else args.learning_rate,
@@ -573,7 +693,11 @@ def run(args, ctx):
             norm_metrics = ({} if args.record_update_norms and
                             (next_step == 1 or next_step % args.log_every == 0 or next_step == stop_step)
                             else None)
-            loss, norm = train_update(model, optimizer, datasets["train"], indices, args, ctx, norm_metrics)
+            routing_metrics = ({} if config.num_experts and
+                               (next_step == 1 or next_step % args.log_every == 0 or next_step == stop_step)
+                               else None)
+            loss, norm = train_update(model, optimizer, datasets["train"], indices, args, ctx,
+                                      norm_metrics, routing_metrics)
             scheduler.step()
             if ctx.device.type == "cuda":
                 torch.cuda.synchronize(ctx.device)
@@ -598,6 +722,8 @@ def run(args, ctx):
                 metrics["adamw_learning_rate"] = adamw_learning_rate
             if norm_metrics is not None:
                 metrics.update(norm_metrics)
+            if routing_metrics is not None:
+                metrics.update(routing_metrics)
             if ctx.device.type == "cuda":
                 memory = torch.tensor(torch.cuda.max_memory_allocated(ctx.device) / 1024**3, device=ctx.device)
                 memories = [torch.zeros_like(memory) for _ in range(ctx.world_size)]

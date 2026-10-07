@@ -255,6 +255,8 @@ def run(args, ctx):
     if args.precision == "bf16" and not torch.cuda.is_bf16_supported():
         raise ValueError("BF16 需要支持它的 CUDA GPU")
     config = MiniLlamaConfig.from_dict(yaml.safe_load(args.model_config.read_text())["model_config"])
+    if config.num_experts:
+        raise ValueError("MoE 训练请使用 pretrain_ddp.py；FSDP2 入口尚未汇总路由辅助损失")
     datasets, fingerprint, tokenizer_path = single.load_data(args.data_dir, config)
     sequence_length = fingerprint["sequence_length"]
     rows = len(datasets["train"])

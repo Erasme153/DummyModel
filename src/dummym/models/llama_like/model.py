@@ -16,7 +16,7 @@ TorchTitan 对同一个模型施加并行策略。
 每个 TransformerBlock 使用 Pre-Norm 结构：
 
     x = x + GQA(RMSNorm(x))
-    x = x + SwiGLU(RMSNorm(x))
+    x = x + SwiGLU_or_MoE(RMSNorm(x))
 
 注意力内部的 GQA、RoPE 和 causal mask 实现在 ``attention.py`` 中。
 """
@@ -32,6 +32,7 @@ from torch import nn
 from .attention import GroupedQueryAttention
 from .config import MiniLlamaConfig
 from .mlp import SwiGLUMLP
+from .moe import MoEOutput, TopKMoE
 from .norm import RMSNorm
 
 
@@ -47,10 +48,14 @@ class MiniLlamaOutput:
         loss:
             传入 ``labels`` 时计算出的 next-token 平均交叉熵；没有传入 labels
             时为 ``None``。
+        aux_loss:
+            MoE 路由负载均衡损失；不混入语言模型交叉熵。
     """
 
     logits: torch.Tensor
     loss: torch.Tensor | None = None
+    aux_loss: torch.Tensor | None = None
+    router_stats: dict[str, torch.Tensor] | None = None
 
 
 class TransformerBlock(nn.Module):
@@ -59,7 +64,7 @@ class TransformerBlock(nn.Module):
     结构严格对应：
 
         RMSNorm -> GQA Causal Attention(+RoPE) -> Residual
-        RMSNorm -> SwiGLU MLP                  -> Residual
+        RMSNorm -> SwiGLU MLP / top-k MoE       -> Residual
 
     Pre-Norm 指的是先归一化再进入子层。残差支路上的原始 hidden states 不做
     归一化，可以为深层网络提供更直接的梯度通路。
@@ -82,16 +87,15 @@ class TransformerBlock(nn.Module):
             config.hidden_size, config.rms_norm_eps
         )
 
-        # SwiGLU 前馈网络：silu(gate_proj(x)) * up_proj(x)，再经 down_proj
-        # 投影回 hidden size，因此其输入输出也都是 [B, T, D]。
-        self.mlp = SwiGLUMLP(config)
+        # Dense 模式为 SwiGLU；MoE 模式用 top-k 路由到多个 SwiGLU 专家。
+        self.mlp = TopKMoE(config) if config.num_experts else SwiGLUMLP(config)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, MoEOutput | None]:
         """执行一个 Transformer Block。
 
         Args:
@@ -101,7 +105,7 @@ class TransformerBlock(nn.Module):
                 token，0/False 表示不能作为 key 被关注的 padding token。
 
         Returns:
-            与输入形状相同的 ``[B, T, D]`` hidden states。
+            与输入形状相同的 hidden states，及可选的 MoE 路由结果。
         """
 
         # 第一条残差：保存未经归一化的输入 x。
@@ -123,10 +127,12 @@ class TransformerBlock(nn.Module):
 
         # Pre-Norm MLP：MLP(RMSNorm(x))。
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        mlp_output = self.mlp(hidden_states)
+        moe_output = mlp_output if isinstance(mlp_output, MoEOutput) else None
+        hidden_states = mlp_output.hidden_states if moe_output is not None else mlp_output
 
         # 残差相加：x <- x + MLP(RMSNorm(x))。
-        return residual + hidden_states
+        return residual + hidden_states, moe_output
 
 
 class MiniLlamaForCausalLM(nn.Module):
@@ -282,12 +288,15 @@ class MiniLlamaForCausalLM(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
 
         # 依次通过 N 个 decoder block；每层都保持 [B, T, D] 形状。
+        moe_outputs = []
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(
+            hidden_states, moe_output = decoder_layer(
                 hidden_states,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
             )
+            if moe_output is not None:
+                moe_outputs.append(moe_output)
 
         # 最终归一化，然后把 hidden size 投影到 vocabulary size：
         # [B, T, D] -> [B, T, V]。
@@ -325,4 +334,20 @@ class MiniLlamaForCausalLM(nn.Module):
                 ignore_index=-100,
             )
 
-        return MiniLlamaOutput(logits=logits, loss=loss)
+        aux_loss = None
+        router_stats = None
+        if moe_outputs:
+            aux_loss = torch.stack([output.aux_loss for output in moe_outputs]).mean()
+            router_stats = {
+                "selected_counts": torch.stack([output.selected_counts for output in moe_outputs]),
+                "kept_counts": torch.stack([output.kept_counts for output in moe_outputs]),
+                "dropped_tokens": torch.stack([output.dropped_tokens for output in moe_outputs]),
+                "router_entropy": torch.stack([output.router_entropy for output in moe_outputs]),
+            }
+            if self.config.moe_routing == "qb" and any(output.qb_beta_candidate is not None
+                                                        for output in moe_outputs):
+                router_stats["qb_beta_candidate"] = torch.stack(
+                    [output.qb_beta_candidate for output in moe_outputs]
+                )
+        return MiniLlamaOutput(logits=logits, loss=loss, aux_loss=aux_loss,
+                               router_stats=router_stats)

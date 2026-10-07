@@ -336,6 +336,8 @@ def main() -> None:
     # YAML 仅保存完整的架构字段，不做递归配置继承；训练超参数直接来自命令行。
     raw_config = yaml.safe_load(args.model_config.read_text(encoding="utf-8"))
     config = MiniLlamaConfig.from_dict(raw_config["model_config"])
+    if config.num_experts:
+        raise ValueError("MoE 训练请使用 pretrain_ddp.py；单卡入口尚未汇总路由辅助损失")
     datasets, data_fingerprint, tokenizer_path = load_data(args.data_dir, config)
     sequence_length = data_fingerprint["sequence_length"]
     rows = len(datasets["train"])

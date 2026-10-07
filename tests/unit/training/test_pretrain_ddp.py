@@ -2,6 +2,7 @@
 
 from datetime import timedelta
 import copy
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -90,6 +91,25 @@ def update_worker(rank, rendezvous):
             assert actual_loss == pytest.approx(expected_loss, abs=1e-6)
             assert model.training
 
+        qb_config = replace(small_config(), num_experts=4, experts_per_token=2,
+                            expert_intermediate_size=16, moe_routing="qb")
+        torch.manual_seed(2026)
+        qb_raw = trainer.MiniLlamaForCausalLM(qb_config)
+        qb_model = DDP(qb_raw, broadcast_buffers=False)
+        qb_args = copy.copy(args)
+        qb_args.batch_size = 2
+        qb_args.moe_aux_loss_coef = 0.0
+        qb_metrics = {}
+        trainer.train_update(qb_model, trainer.single.make_optimizer(qb_raw, qb_args), dataset,
+                             np.arange(5), qb_args, ctx, routing_metrics=qb_metrics)
+        for layer in qb_raw.layers:
+            beta = layer.mlp.qb_beta
+            other = beta.clone()
+            dist.broadcast(other, src=0)
+            torch.testing.assert_close(beta, other, atol=0, rtol=0)
+            assert torch.isfinite(beta).all()
+        assert "router_qb_bias_max" in qb_metrics
+
         # rank 0 写盘异常不能让另一个进程永久等在 collective 上。
         def fail_write():
             raise OSError("test write failure")
@@ -121,7 +141,8 @@ def resume_worker(rank, rendezvous, directory, optimizer_name):
     try:
         # 含 dropout，确保测试确实依赖恢复 RNG，而不是仅加载模型/优化器。
         base = ["pretrain_ddp.py", "--data-dir", str(root / "data"),
-                "--model-config", str(root / "model.yaml"), "--device", "cpu",
+                "--model-config", str(root / ("moe_model.yaml" if optimizer_name in ("moe", "moe_qb")
+                                                else "model.yaml")), "--device", "cpu",
                 "--precision", "fp32", "--batch-size", "2", "--grad-accum-steps", "1",
                 "--epochs", "2", "--train-sequences", "5", "--warmup-steps", "1",
                 "--eval-every", "2", "--save-every", "2"]
@@ -131,6 +152,10 @@ def resume_worker(rank, rendezvous, directory, optimizer_name):
         elif optimizer_name in ("muonh", "adamh"):
             base += ["--optimizer", optimizer_name, "--hyperball-lr", "0.005",
                      "--adamw-lr", "0.001", "--record-update-norms"]
+        elif optimizer_name == "moe":
+            base += ["--moe-aux-loss-coef", "0.01", "--log-every", "1"]
+        elif optimizer_name == "moe_qb":
+            base += ["--moe-routing", "qb", "--moe-aux-loss-coef", "0", "--log-every", "1"]
         for name, extra in (("full", []), ("resumed", ["--stop-after-steps", "1"]),
                             ("resumed", ["--resume", str(output_root / "resumed/checkpoint.pt")])):
             sys.argv = base + ["--output-dir", str(output_root / name)] + extra
@@ -153,8 +178,20 @@ def resume_worker(rank, rendezvous, directory, optimizer_name):
             assert resumed["contract"]["recipe"]["optimizer"] == optimizer_name
             assert resumed["contract"]["recipe"]["hyperball_lr"] == 0.005
             assert resumed["contract"]["recipe"]["adamw_lr"] == 0.001
+        elif optimizer_name == "moe":
+            assert resumed["contract"]["recipe"]["moe_aux_loss_coef"] == 0.01
+            assert resumed["model_config"]["num_experts"] == 4
+        elif optimizer_name == "moe_qb":
+            assert resumed["contract"]["recipe"]["moe_aux_loss_coef"] == 0
+            assert resumed["model_config"]["moe_routing"] == "qb"
+            assert any(key.endswith("qb_beta") for key in resumed["model_state_dict"])
         # 推理脚本使用未包 DDP 的模型；不能让 checkpoint 权重带 module. 前缀。
-        loaded = trainer.MiniLlamaForCausalLM(small_config(0.1))
+        loaded_config = (replace(small_config(0.1), num_experts=4, experts_per_token=2,
+                                 expert_intermediate_size=16,
+                                 moe_routing="qb" if optimizer_name == "moe_qb" else "topk")
+                         if optimizer_name in ("moe", "moe_qb")
+                         else small_config(0.1))
+        loaded = trainer.MiniLlamaForCausalLM(loaded_config)
         loaded.load_state_dict(resumed["model_state_dict"], strict=True)
         wrong = copy.deepcopy(resumed["contract"])
         wrong["world_size"] = 1
@@ -180,6 +217,9 @@ def prepared_data(tmp_path):
     vocab = {"<unk>": 0, "<s>": 1, "</s>": 2, **{f"word{i}": i + 3 for i in range(61)}}
     Tokenizer(models.WordLevel(vocab, unk_token="<unk>")).save(str(data / "tokenizer.json"))
     (tmp_path / "model.yaml").write_text(yaml.safe_dump({"model_config": small_config(0.1).to_dict()}))
+    moe_config = replace(small_config(0.1), num_experts=4, experts_per_token=2,
+                         expert_intermediate_size=16)
+    (tmp_path / "moe_model.yaml").write_text(yaml.safe_dump({"model_config": moe_config.to_dict()}))
     splits = {}
     for split, count in (("train", 7), ("validation", 3)):
         rows = ToyDataset(count).rows.numpy().astype("<u2")
@@ -194,7 +234,7 @@ def prepared_data(tmp_path):
 
 
 @pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="需要 Gloo")
-@pytest.mark.parametrize("optimizer_name", ["adamw", "muon", "muonh", "adamh"])
+@pytest.mark.parametrize("optimizer_name", ["adamw", "muon", "muonh", "adamh", "moe", "moe_qb"])
 def test_two_rank_resume_restores_rng_and_epoch_tail(prepared_data, optimizer_name):
     mp.spawn(resume_worker,
              args=(str(prepared_data / "rendezvous"), str(prepared_data), optimizer_name),

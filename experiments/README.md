@@ -25,16 +25,16 @@ experiments/
 ├── m05_scaling/
 │   └── exp001_isoflop/
 │       └── README.md
-└── m06_optimizer/
-    └── exp001_muon_hyperball/
+├── m06_optimizer/
+│   └── exp001_muon_hyperball/
+│       └── README.md
+└── m07_moe/
+    └── exp001_router_ep/
         └── README.md
 ```
 
-最新报告：[M6：Muon、MuonH 与 AdamH](m06_optimizer/exp001_muon_hyperball/README.md)。
-99M / 100M-token 对照中，MuonW 的独立验证 loss 为 3.405980，
-MuonH、AdamH 各自最佳结果为 3.414223、3.605910。
-213M base model 的独立评测见
-[M4 报告](m04_base/exp001_213m/README.md)。
+最新报告：[M7：Top-k MoE、QB 路由与双卡 EP](m07_moe/exp001_router_ep/README.md)。
+MoE 与 active-parameter 匹配的 dense 对照、路由负载和 EP 性能已完成。
 
 每份 README 只需要回答五个问题：
 

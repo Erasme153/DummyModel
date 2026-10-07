@@ -2,7 +2,7 @@
 
 DummyM 是一个面向初学者的、从零实现并预训练 Llama-like Decoder-only 语言模型的学习型工程。项目以原生 PyTorch 为核心，目标是在两张 NVIDIA H20 或等价算力的 GPU 上跑通模型与 Tokenizer 实现、数据工程、预训练、scaling、分布式训练、评测、后训练和推理流程。
 
-> 当前状态：M1–M4 已完成。M4 的 213M base model 已训练 1B tokens，同集验证 loss 为 2.878212；M5 已完成初步等算力对照、低预算配对 seed 和 `2.00e17` 留出预算验证。结论只适用于已测模型与预算，尚无可靠的大模型外推。详见 [M4 报告](experiments/m04_base/exp001_213m/README.md)和 [M5 报告](experiments/m05_scaling/exp001_isoflop/README.md)。
+> 当前状态：M1–M7 的既定实验已完成。M4 的 213M base model 已训练 1B tokens，同集验证 loss 为 2.878212；M5 的 scaling 结论仅适用于已测模型与预算；M6 完成优化器对照，M7 完成 MoE、QB 和双卡 EP 对照。详见 [实验报告索引](experiments/README.md)。
 
 ## 项目定位与 Marin 的关系
 
@@ -373,8 +373,8 @@ pretrain/
 | **M3 · Distributed systems** | DDP、FSDP2 与 profiling | 单卡/DDP/FSDP2 的 99M 完整预算一致性、恢复、吞吐、显存对照，Nsight 短程剖析及 213M 双卡短跑已完成；TorchTitan 待接入，EP 留到 M7。 |
 | **M4 · 213M base pretraining** | 运行第一版“正式”base model 训练 | 已完成双卡 1B-token 训练、checkpoint、同集 loss 和零样本 base eval；模型卡与限制见 [M4 报告](experiments/m04_base/exp001_213m/README.md)。 |
 | **M5 · Mini-Delphi scaling** | IsoFLOP、scaling law、scaling recipe 与外推验证 | 已完成两档初步等算力对照、39M/99M 配对 seed 和 `2.00e17` 留出预算检查，见 [M5 报告](experiments/m05_scaling/exp001_isoflop/README.md)。39M 在已测低预算内更优；现有数据不足以确定全局计算最优规模或外推大模型。`Mini-Delphi` 是 DummyM 的教学实验名，不代表 Marin 官方 Delphi 的复现结果。 |
-| **M6 · Optimizer research** | Muon 与 Hyperball 系列方法如何公平比较 | 以 M2/M5 的 AdamW recipe 为固定基线，对 Muon 及 Hyperball 约束版本（如 AdamH/MuonH）做单变量 A/B；记录 loss、吞吐、参数范数和 update/parameter ratio；新优化器使用独立 scaling heuristic，不能直接沿用 AdamW 最优参数。 |
-| **M7 · Mini-MoE systems** | Sparse MoE、Router、负载均衡和 Expert Parallel | 先实现可测试的 top-k router 与专家层，再加入容量、token dispatch/combine、负载与丢 token 指标；将 Quantile Balancing（QB）作为独立路由实验；与 active-parameter/compute 匹配的 dense baseline 比较，最后接入 EP 并 profile 通信。 |
+| **M6 · Optimizer research** | Muon 与 Hyperball 系列方法如何公平比较 | 已完成 AdamW、MuonW、MuonH、AdamH 的固定预算对照，记录 loss、吞吐、范数与更新比例；结果见 [M6 报告](experiments/m06_optimizer/exp001_muon_hyperball/README.md)。 |
+| **M7 · Mini-MoE systems** | Sparse MoE、Router、负载均衡和 Expert Parallel | 已完成 top-k、容量、QB、匹配 active parameters 的 dense 对照、双卡 EP 与 Nsight 通信剖析；结果见 [M7 报告](experiments/m07_moe/exp001_router_ep/README.md)。 |
 | **M8 · Midtraining & cooldown** | 数据混合变化与学习率退火如何影响能力 | 从同一 base checkpoint 分叉，对高质量/领域数据配比、阶段 token budget 和 cooldown schedule 做受控实验；同时看通用能力保持、目标能力增益和遗忘，而不只看单项 benchmark。 |
 | **M9 · Post-training** | SFT、偏好优化与可验证奖励强化学习 | 定义 chat template 和数据审计；完成 SFT、DPO、GRPO/RLVR 的目标函数、reference policy/奖励与评测。学习顺序可按 SFT → DPO → GRPO，但默认应从同一 SFT checkpoint 建立 DPO 与 GRPO 对照分支，不假设三者必须串行才正确。 |
 

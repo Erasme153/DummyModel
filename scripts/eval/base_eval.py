@@ -50,6 +50,20 @@ def load_model(checkpoint_path: Path, device: torch.device):
         raise FileNotFoundError(checkpoint_path)
     # 本项目自产的 checkpoint 包含非 Tensor 的配置和训练状态。
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if checkpoint.get("format_version") == 4 and checkpoint.get("contract", {}).get("parallelism") == "ep2":
+        # EP metadata points at two local shards. Shared keys must agree; expert
+        # keys retain their global IDs, so the union is a regular model state.
+        merged = {}
+        for name in checkpoint["shards"]:
+            shard = torch.load(checkpoint_path.parent / name, map_location="cpu",
+                               weights_only=True, mmap=True)["model_state_dict"]
+            for key, value in shard.items():
+                if key in merged:
+                    if not torch.equal(merged[key], value):
+                        raise ValueError(f"EP 共享权重不一致：{key}")
+                else:
+                    merged[key] = value
+        checkpoint["model_state_dict"] = merged
     config = MiniLlamaConfig.from_dict(checkpoint["model_config"])
     model = MiniLlamaForCausalLM(config)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
