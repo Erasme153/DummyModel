@@ -179,8 +179,8 @@ def run_benchmark(args, model, config, checkpoint, device):
             raise NotImplementedError("此入口只支持所选的选择题任务")
 
     tasks = [task.strip() for task in args.tasks.split(",") if task.strip()]
-    if not tasks or any(task not in {"hellaswag", "arc_easy"} for task in tasks):
-        raise ValueError("当前适配器只支持 hellaswag 和 arc_easy")
+    if not tasks or any(task not in {"hellaswag", "arc_easy", "mathqa"} for task in tasks):
+        raise ValueError("当前适配器只支持 hellaswag、arc_easy 和 mathqa")
     result = lm_eval.simple_evaluate(model=DummyMLM(), tasks=tasks, num_fewshot=0,
                                      limit=args.limit or None, batch_size=args.batch_size,
                                      device=str(device), log_samples=False, bootstrap_iters=1000,

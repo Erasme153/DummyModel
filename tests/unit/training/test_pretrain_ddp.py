@@ -6,6 +6,7 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -205,6 +206,49 @@ def resume_worker(rank, rendezvous, directory, optimizer_name):
         dist.destroy_process_group()
 
 
+def init_checkpoint_worker(rank, rendezvous, directory):
+    ctx = init_worker(rank, rendezvous)
+    root = Path(directory)
+    base = ["pretrain_ddp.py", "--model-config", str(root / "model.yaml"),
+            "--device", "cpu", "--precision", "fp32", "--batch-size", "2",
+            "--grad-accum-steps", "1", "--warmup-steps", "0", "--seed", "2026"]
+
+    def run(data, output, *options):
+        sys.argv = base + ["--data-dir", str(data), "--output-dir", str(output), *options]
+        trainer.run(trainer.parse_args(), ctx)
+        return torch.load(output / "checkpoint.pt", weights_only=True)
+
+    try:
+        source_path = root / "ddp_source/checkpoint.pt"
+        source = run(root / "data", root / "ddp_source", "--learning-rate", "0.001",
+                     "--stop-after-steps", "1")
+        original_update = trainer.train_update
+
+        def check_start(model, optimizer, *args, **kwargs):
+            assert_identical(trainer.unwrap(model).state_dict(), source["model_state_dict"])
+            assert_identical(optimizer.state_dict()["state"], source["optimizer_state_dict"]["state"])
+            torch.testing.assert_close(torch.get_rng_state(), source["rng_states"][rank]["cpu"], atol=0, rtol=0)
+            assert all(group["lr"] == group["initial_lr"] == 5e-5 for group in optimizer.param_groups)
+            return original_update(model, optimizer, *args, **kwargs)
+
+        trainer.train_update = check_start
+        initialized = run(root / "new_data", root / "ddp_cooldown", "--learning-rate", "5e-5",
+                          "--min-lr-ratio", "0.1", "--init-checkpoint", str(source_path),
+                          "--stop-after-steps", "1")
+        trainer.train_update = original_update
+        assert initialized["progress"]["step"] == 1
+        assert initialized["initialization"]["source_step"] == 1
+        resumed = run(root / "new_data", root / "ddp_cooldown", "--learning-rate", "5e-5",
+                      "--min-lr-ratio", "0.1", "--resume", str(root / "ddp_cooldown/checkpoint.pt"))
+        uninterrupted = run(root / "new_data", root / "ddp_uninterrupted", "--learning-rate", "5e-5",
+                            "--min-lr-ratio", "0.1", "--init-checkpoint", str(source_path))
+        for key in ("model_state_dict", "optimizer_state_dict", "scheduler_state_dict",
+                    "progress", "rng_states", "initialization"):
+            assert_identical(resumed[key], uninterrupted[key])
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="需要 Gloo")
 def test_two_ranks_match_single_update_and_validation(tmp_path):
     mp.spawn(update_worker, args=(str(tmp_path / "rendezvous"),), nprocs=2, join=True)
@@ -233,12 +277,29 @@ def prepared_data(tmp_path):
     return tmp_path
 
 
+def make_new_data(root):
+    new_data = root / "new_data"
+    shutil.copytree(root / "data", new_data)
+    train_bin = new_data / "train.bin"
+    content = bytearray(train_bin.read_bytes())
+    content[:2] = (4).to_bytes(2, "little")
+    train_bin.write_bytes(content)
+    return new_data
+
+
 @pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="需要 Gloo")
 @pytest.mark.parametrize("optimizer_name", ["adamw", "muon", "muonh", "adamh", "moe", "moe_qb"])
 def test_two_rank_resume_restores_rng_and_epoch_tail(prepared_data, optimizer_name):
     mp.spawn(resume_worker,
              args=(str(prepared_data / "rendezvous"), str(prepared_data), optimizer_name),
              nprocs=2, join=True)
+
+
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="需要 Gloo")
+def test_two_rank_init_checkpoint_and_resume(prepared_data):
+    make_new_data(prepared_data)
+    mp.spawn(init_checkpoint_worker,
+             args=(str(prepared_data / "init_rendezvous"), str(prepared_data)), nprocs=2, join=True)
 
 
 @pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="需要 Gloo")
@@ -265,6 +326,80 @@ def test_python_and_torchrun_entrypoints(prepared_data):
         assert summary["status"] == "paused"
         assert summary["progress"]["tokens_seen"] == 32
         assert len(list((output / "tensorboard").glob("events.out.tfevents.*"))) == 1
+
+
+def test_init_checkpoint_preserves_adamw_state_and_resets_new_stage(prepared_data, monkeypatch):
+    torch.set_num_threads(1)
+    root = prepared_data
+    new_data = make_new_data(root)
+    train_bin = new_data / "train.bin"
+    ctx = trainer.Context(0, 1, torch.device("cpu"))
+    base = ["pretrain_ddp.py", "--model-config", str(root / "model.yaml"),
+            "--device", "cpu", "--precision", "fp32", "--batch-size", "2",
+            "--grad-accum-steps", "1", "--warmup-steps", "0", "--seed", "2026"]
+
+    def run(data, output, *options):
+        monkeypatch.setattr(sys, "argv", base + ["--data-dir", str(data),
+                                              "--output-dir", str(output), *options])
+        trainer.run(trainer.parse_args(), ctx)
+        return torch.load(output / "checkpoint.pt", weights_only=True)
+
+    source_path = root / "source/checkpoint.pt"
+    source = run(root / "data", root / "source", "--learning-rate", "0.001",
+                 "--stop-after-steps", "1")
+    assert source["progress"]["step"] == 1
+    assert source["contract"]["data"]["train_sha256"] != trainer.single.file_sha256(train_bin)
+
+    original_update = trainer.train_update
+    starts = []
+
+    def check_start(model, optimizer, *args, **kwargs):
+        assert_identical(trainer.unwrap(model).state_dict(), source["model_state_dict"])
+        assert_identical(optimizer.state_dict()["state"], source["optimizer_state_dict"]["state"])
+        torch.testing.assert_close(torch.get_rng_state(), source["rng_states"][0]["cpu"], atol=0, rtol=0)
+        assert all(group["lr"] == group["initial_lr"] == 5e-5 for group in optimizer.param_groups)
+        starts.append(True)
+        return original_update(model, optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(trainer, "train_update", check_start)
+    common = ("--learning-rate", "5e-5", "--init-checkpoint", str(source_path),
+              "--stop-after-steps", "1")
+    constant = run(new_data, root / "constant", *common, "--min-lr-ratio", "1")
+    cooldown = run(new_data, root / "cooldown", *common, "--min-lr-ratio", "0.1")
+    monkeypatch.setattr(trainer, "train_update", original_update)
+    assert len(starts) == 2
+    for checkpoint in (constant, cooldown):
+        assert checkpoint["progress"]["step"] == 1
+        assert checkpoint["progress"]["tokens_seen"] == 16
+        assert checkpoint["initialization"]["source_step"] == 1
+        assert checkpoint["initialization"]["source_tokens_seen"] == 16
+        assert checkpoint["initialization"]["checkpoint"] == str(source_path)
+        assert checkpoint["contract"]["data"]["train_sha256"] != source["contract"]["data"]["train_sha256"]
+        assert_identical(checkpoint["model_state_dict"], constant["model_state_dict"])
+    assert all(group["lr"] == 5e-5 for group in constant["optimizer_state_dict"]["param_groups"])
+    assert all(group["lr"] < 5e-5 for group in cooldown["optimizer_state_dict"]["param_groups"])
+    assert cooldown["scheduler_state_dict"]["base_lrs"] == [5e-5, 5e-5]
+
+    resumed = run(new_data, root / "cooldown", "--learning-rate", "5e-5",
+                  "--min-lr-ratio", "0.1", "--resume", str(root / "cooldown/checkpoint.pt"))
+    uninterrupted = run(new_data, root / "uninterrupted", "--learning-rate", "5e-5",
+                        "--min-lr-ratio", "0.1", "--init-checkpoint", str(source_path))
+    for key in ("model_state_dict", "optimizer_state_dict", "scheduler_state_dict",
+                "progress", "rng_states", "initialization"):
+        assert_identical(resumed[key], uninterrupted[key])
+
+    args = SimpleNamespace(weight_decay=0.1, beta1=0.9, beta2=0.95)
+    config = small_config(0.1)
+    fingerprint = resumed["contract"]["data"]
+    with pytest.raises(ValueError, match="tokenizer"):
+        trainer.load_initialization(source_path, config, {**fingerprint, "tokenizer_sha256": "wrong"}, args, ctx)
+    with pytest.raises(ValueError, match="betas"):
+        trainer.load_initialization(source_path, config, fingerprint,
+                                    SimpleNamespace(weight_decay=0.1, beta1=0.8, beta2=0.95), ctx)
+    monkeypatch.setattr(sys, "argv", base + ["--output-dir", str(root / "invalid"),
+                                          "--resume", str(source_path), "--init-checkpoint", str(source_path)])
+    with pytest.raises(SystemExit):
+        trainer.parse_args()
 
 
 def test_rejects_old_checkpoint_format(tmp_path):

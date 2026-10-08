@@ -375,8 +375,8 @@ pretrain/
 | **M5 · Mini-Delphi scaling** | IsoFLOP、scaling law、scaling recipe 与外推验证 | 已完成两档初步等算力对照、39M/99M 配对 seed 和 `2.00e17` 留出预算检查，见 [M5 报告](experiments/m05_scaling/exp001_isoflop/README.md)。39M 在已测低预算内更优；现有数据不足以确定全局计算最优规模或外推大模型。`Mini-Delphi` 是 DummyM 的教学实验名，不代表 Marin 官方 Delphi 的复现结果。 |
 | **M6 · Optimizer research** | Muon 与 Hyperball 系列方法如何公平比较 | 已完成 AdamW、MuonW、MuonH、AdamH 的固定预算对照，记录 loss、吞吐、范数与更新比例；结果见 [M6 报告](experiments/m06_optimizer/exp001_muon_hyperball/README.md)。 |
 | **M7 · Mini-MoE systems** | Sparse MoE、Router、负载均衡和 Expert Parallel | 已完成 top-k、容量、QB、匹配 active parameters 的 dense 对照、双卡 EP 与 Nsight 通信剖析；结果见 [M7 报告](experiments/m07_moe/exp001_router_ep/README.md)。 |
-| **M8 · Midtraining & cooldown** | 数据混合变化与学习率退火如何影响能力 | 从同一 base checkpoint 分叉，对高质量/领域数据配比、阶段 token budget 和 cooldown schedule 做受控实验；同时看通用能力保持、目标能力增益和遗忘，而不只看单项 benchmark。 |
-| **M9 · Post-training** | SFT、偏好优化与可验证奖励强化学习 | 定义 chat template 和数据审计；完成 SFT、DPO、GRPO/RLVR 的目标函数、reference policy/奖励与评测。学习顺序可按 SFT → DPO → GRPO，但默认应从同一 SFT checkpoint 建立 DPO 与 GRPO 对照分支，不假设三者必须串行才正确。 |
+| **M8 · Midtraining & cooldown** | 数据混合变化与学习率退火如何影响能力 | 已完成同一 base checkpoint 上固定 100M-token 预算的 LR 退火及 50% OpenWebMath 混合对照，并评估数学/通用文本 loss 与两项通用零样本任务；数学解题任务结果尚未落盘，见 [M8 报告](experiments/m08_midtraining/exp001_cooldown_mathmix/README.md)。 |
+| **M9 · Post-training** | SFT、偏好优化与可验证奖励强化学习 | 已完成 UltraFeedback SFT/DPO、GSM8K SFT/GRPO、数据审计、独立验证和官方测试；GRPO 的 pass@4 有小幅提升，但答案集中，不能据此认定推理能力提高。实现与限制见 [M9 报告](experiments/m09_posttraining/exp001_sft_dpo_grpo/README.md)。 |
 
 ### 每个里程碑的统一完成标准
 

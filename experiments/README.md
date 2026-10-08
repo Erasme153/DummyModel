@@ -28,13 +28,19 @@ experiments/
 ├── m06_optimizer/
 │   └── exp001_muon_hyperball/
 │       └── README.md
-└── m07_moe/
-    └── exp001_router_ep/
+├── m07_moe/
+│   └── exp001_router_ep/
+│       └── README.md
+├── m08_midtraining/
+│   └── exp001_cooldown_mathmix/
+│       └── README.md
+└── m09_posttraining/
+    └── exp001_sft_dpo_grpo/
         └── README.md
 ```
 
-最新报告：[M7：Top-k MoE、QB 路由与双卡 EP](m07_moe/exp001_router_ep/README.md)。
-MoE 与 active-parameter 匹配的 dense 对照、路由负载和 EP 性能已完成。
+最新报告：[M9：SFT、DPO 与 GSM8K GRPO](m09_posttraining/exp001_sft_dpo_grpo/README.md)。
+M9 已完成训练与最终评测；GRPO 的 GSM8K pass@4 小幅提高，但未证实数学推理能力提高。
 
 每份 README 只需要回答五个问题：
 

@@ -9,7 +9,9 @@
 不是一个 micro-batch，也不是所有 rank 的更新次数相加。
 
 复用 pretrain.py 的只读数据、配置校验、优化器和 LR 函数，保留原单卡脚本。
-本入口仅支持同一 world size/训练约定恢复；不支持跨卡数恢复、FSDP 或 FP16。
+本入口仅支持同一 world size/训练约定恢复；--init-checkpoint 可从同卡数的
+AdamW checkpoint 开始新阶段，并保留模型、优化器和各 rank RNG 状态。
+不支持跨卡数恢复、FSDP 或 FP16。
 CUDA 使用 NCCL；CPU/FP32 使用 Gloo，供小模型正确性测试。
 
 DDP 是数据并行：每个进程都有完整模型、梯度和优化器，不是把模型拆成几份。
@@ -51,6 +53,8 @@ def build_parser(description=None, *, device_help="cpu 或 cuda；torchrun 下�
     parser.add_argument("--model-config", type=Path, default=PROJECT_ROOT / "configs/model/p099m.yaml")
     parser.add_argument("--output-dir", type=Path, help="新训练必须指定，已有目录拒绝覆盖")
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--init-checkpoint", type=Path,
+                        help="从 DDP AdamW checkpoint 初始化新阶段；保留权重、动量和 RNG，重置数据游标及 LR 计划")
     parser.add_argument("--device", default="cuda", help=device_help)
     parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--batch-size", type=int, default=4, help="每个 rank 的 micro-batch 序列数")
@@ -139,6 +143,10 @@ def parse_args(parser=None):
         parser.error("AdamW 模式使用 --learning-rate，不使用 --adamw-lr")
     if args.output_dir is None and args.resume is None:
         parser.error("新训练必须指定 --output-dir")
+    if args.resume is not None and args.init_checkpoint is not None:
+        parser.error("--resume 与 --init-checkpoint 不能同时使用")
+    if args.init_checkpoint is not None and args.optimizer != "adamw":
+        parser.error("--init-checkpoint 当前仅支持 --optimizer adamw")
     if args.moe_aux_loss_coef is not None and (not math.isfinite(args.moe_aux_loss_coef)
                                                or args.moe_aux_loss_coef < 0):
         parser.error("moe-aux-loss-coef 必须为有限非负数")
@@ -497,7 +505,8 @@ def evaluate(model, dataset, args, ctx):
         model.train(was_training)
 
 
-def save_checkpoint(path, model, optimizer, scheduler, progress, contract, tokenizer_path, ctx):
+def save_checkpoint(path, model, optimizer, scheduler, progress, contract, tokenizer_path, ctx,
+                    initialization=None):
     """所有 rank 都要调用：先收集各自 RNG，再只让 rank 0 原子写入文件。
 
     DDP 同步后各 rank 的模型/优化器相同，因此保存一份即可；RNG 可能不同，
@@ -519,6 +528,8 @@ def save_checkpoint(path, model, optimizer, scheduler, progress, contract, token
             "progress": dict(progress), "contract": contract, "rng_states": states,
             "tokenizer_path": str(tokenizer_path.resolve()), "torch_version": str(torch.__version__),
         }
+        if initialization is not None:
+            checkpoint["initialization"] = initialization
         temporary = path.with_suffix(".pt.tmp")
         torch.save(checkpoint, temporary)
         temporary.replace(path)
@@ -531,6 +542,24 @@ def load_resume(path, contract, ctx):
         raise ValueError("恢复失败：需要本 DDP 脚本的 v2 checkpoint，且卡数、模型、数据和训练约定必须一致")
     if len(checkpoint.get("rng_states", [])) != ctx.world_size:
         raise ValueError("checkpoint 缺少各 rank 的 RNG 状态")
+    return checkpoint
+
+
+def load_initialization(path, config, fingerprint, args, ctx):
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    source = checkpoint.get("contract", {})
+    source_recipe = source.get("recipe", {})
+    if checkpoint.get("format_version") != 2 or source_recipe.get("optimizer", "adamw") != "adamw":
+        raise ValueError("阶段初始化需要本 DDP 脚本的 v2 AdamW checkpoint")
+    if checkpoint.get("model_config") != config.to_dict() or source.get("model_config") != config.to_dict():
+        raise ValueError("阶段初始化的模型配置与源 checkpoint 不一致")
+    source_data = source.get("data", {})
+    if any(source_data.get(key) != fingerprint[key] for key in ("tokenizer_sha256", "sequence_length")):
+        raise ValueError("阶段初始化需要相同 tokenizer 和序列长度")
+    if source.get("world_size") != ctx.world_size or len(checkpoint.get("rng_states", [])) != ctx.world_size:
+        raise ValueError("阶段初始化需要与源 checkpoint 相同的卡数及各 rank RNG 状态")
+    if any(source_recipe.get(key) != getattr(args, key) for key in ("weight_decay", "beta1", "beta2")):
+        raise ValueError("阶段初始化仅允许调整 AdamW 学习率，betas 和 weight decay 必须与源 checkpoint 一致")
     return checkpoint
 
 
@@ -596,6 +625,14 @@ def run(args, ctx):
         if any(item != contract for item in contracts):
             raise ValueError("各 rank 的模型、数据或训练约定不一致")
     checkpoint = load_resume(args.resume, contract, ctx) if args.resume else None
+    source_checkpoint = (load_initialization(args.init_checkpoint, config, fingerprint, args, ctx)
+                         if args.init_checkpoint else None)
+    initialization = (checkpoint.get("initialization") if checkpoint else None)
+    if source_checkpoint is not None:
+        initialization = {"checkpoint": str(args.init_checkpoint.resolve()),
+                          "source_step": source_checkpoint["progress"]["step"],
+                          "source_tokens_seen": source_checkpoint["progress"]["tokens_seen"],
+                          "source_data": source_checkpoint["contract"]["data"]}
 
     # 先用相同 seed 初始化。DDP 构造时还会从 rank 0 同步权重，确保一致起点。
     torch.manual_seed(args.seed)
@@ -607,6 +644,13 @@ def run(args, ctx):
         optimizer = HyperballWithAuxAdamW(raw_model, args)
     else:
         optimizer = single.make_optimizer(raw_model, args)
+    if source_checkpoint is not None:
+        raw_model.load_state_dict(source_checkpoint["model_state_dict"], strict=True)
+        optimizer.load_state_dict(source_checkpoint["optimizer_state_dict"])
+        # load_state_dict 会带回旧阶段的 lr/initial_lr；调度器必须以新阶段 LR 为基准。
+        for group in optimizer.param_groups:
+            group["lr"] = args.learning_rate
+            group["initial_lr"] = args.learning_rate
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=lambda i: single.lr_factor(i, total_steps, args.warmup_steps, args.min_lr_ratio))
     progress = {"step": 0, "epoch": 0, "next_sequence": 0, "tokens_seen": 0,
@@ -643,10 +687,12 @@ def run(args, ctx):
         if ctx.rank == 0:
             writer = SummaryWriter(str(output / "tensorboard"),
                                    purge_step=progress["step"] + 1 if checkpoint else None)
-        if checkpoint:
+        if checkpoint or source_checkpoint:
             # 模型重建会消耗 RNG。全部构造完再恢复，不改变后续 dropout 等随机序列。
-            single.restore_rng(checkpoint["rng_states"][ctx.rank], ctx.device)
+            saved = checkpoint if checkpoint else source_checkpoint
+            single.restore_rng(saved["rng_states"][ctx.rank], ctx.device)
             del checkpoint
+            del source_checkpoint
         started = time.perf_counter()
         start_step = progress["step"]
         if ctx.device.type == "cuda":
@@ -669,7 +715,8 @@ def run(args, ctx):
 
         if progress["step"] == 0:
             validate()
-            save_checkpoint(checkpoint_path, model, optimizer, scheduler, progress, contract, tokenizer_path, ctx)
+            save_checkpoint(checkpoint_path, model, optimizer, scheduler, progress, contract,
+                            tokenizer_path, ctx, initialization)
         model.train()
         order_epoch = None
         while progress["step"] < stop_step:
@@ -742,7 +789,8 @@ def run(args, ctx):
             if step % args.eval_every == 0 or step == stop_step:
                 validate()
             if step % args.save_every == 0 or step == stop_step:
-                save_checkpoint(checkpoint_path, model, optimizer, scheduler, progress, contract, tokenizer_path, ctx)
+                save_checkpoint(checkpoint_path, model, optimizer, scheduler, progress, contract,
+                                tokenizer_path, ctx, initialization)
                 if writer:
                     writer.flush()
 
@@ -755,6 +803,8 @@ def run(args, ctx):
                    "session_elapsed_seconds": round(session_seconds.item(), 2),
                    "prediction_tokens_seen": progress["tokens_seen"] // sequence_length * (sequence_length - 1),
                    "checkpoint": str(checkpoint_path), "tensorboard": str(output / "tensorboard")}
+        if initialization is not None:
+            summary["initialization"] = initialization
 
         def write_summary():
             temporary = output / "summary.json.tmp"

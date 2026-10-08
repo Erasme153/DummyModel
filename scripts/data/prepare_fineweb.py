@@ -72,6 +72,8 @@ def parse_args() -> argparse.Namespace:
                         help="本地 Mistral-7B-v0.1/tokenizer.json")
     parser.add_argument("--output-dir", type=Path,
                         default=PROJECT_ROOT / "data/tokenized/m01_fineweb_100m")
+    parser.add_argument("--exclude-documents", type=Path,
+                        help="已有数据的 documents.jsonl；按规范化正文 SHA-256 排除其中全部文档")
     parser.add_argument("--train-tokens", type=int, default=100_000_000)
     parser.add_argument("--validation-tokens", type=int, default=1_000_000)
     parser.add_argument("--sequence-length", type=int, default=2048)
@@ -333,6 +335,25 @@ def write_json_line(handle, record: dict) -> None:
     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def load_excluded_documents(path: Path) -> tuple[set[bytes], str]:
+    """Load prior document hashes and fingerprint the exclusion index itself."""
+    excluded: set[bytes] = set()
+    index_hash = hashlib.sha256()
+    with path.open("rb") as handle:
+        for number, line in enumerate(handle, 1):
+            index_hash.update(line)
+            try:
+                value = json.loads(line)["sha256"]
+                if not isinstance(value, str) or len(value) != 64:
+                    raise ValueError("SHA-256 必须为 64 位十六进制字符串")
+                excluded.add(bytes.fromhex(value))
+            except (KeyError, ValueError, TypeError) as exc:
+                raise ValueError(f"排除索引第 {number} 行的 sha256 无效：{path}") from exc
+    if not excluded:
+        raise ValueError(f"排除索引为空：{path}")
+    return excluded, index_hash.hexdigest()
+
+
 def main() -> None:
     args = parse_args()
     root = args.input_dir.resolve()
@@ -358,6 +379,9 @@ def main() -> None:
     # 这两项与 add_special_tokens=False 各管一件事，不会互相替代。
     tokenizer.no_padding()
     tokenizer.no_truncation()
+
+    excluded, exclusion_sha256 = (load_excluded_documents(args.exclude_documents)
+                                  if args.exclude_documents is not None else (set(), None))
 
     # 防止误覆盖一次成功实验。重新准备时使用新的输出目录，不提供强制覆盖开关。
     output = args.output_dir.resolve()
@@ -406,6 +430,9 @@ def main() -> None:
                 # 不同网址也会判重；同一网址若正文不同，则不会仅因为 URL 相同被去掉。
                 # digest() 返回二进制指纹用于 set；写索引时才转成可读的十六进制。
                 digest = hashlib.sha256(text.encode("utf-8")).digest()
+                if digest in excluded:
+                    counts["excluded_documents"] += 1
+                    continue
                 if digest in seen:
                     counts["duplicate_documents"] += 1
                     continue
@@ -491,6 +518,13 @@ def main() -> None:
         "splits": {split: writer.stats() for split, writer in writers.items()},
         "elapsed_seconds": round(time.monotonic() - start, 2),
     }
+    if args.exclude_documents is not None:
+        summary["exclusion"] = {
+            "documents": str(args.exclude_documents.resolve()),
+            "index_sha256": exclusion_sha256,
+            "unique_hashes": len(excluded),
+            "skipped_documents": counts["excluded_documents"],
+        }
     (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
                                          encoding="utf-8")
     print(json.dumps({"status": summary["status"], "splits": summary["splits"],

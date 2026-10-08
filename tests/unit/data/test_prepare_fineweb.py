@@ -20,6 +20,10 @@ SCRIPT = Path(__file__).resolve().parents[3] / "scripts/data/prepare_fineweb.py"
 spec = importlib.util.spec_from_file_location("prepare_fineweb", SCRIPT)
 prepare = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(prepare)
+MIX_SCRIPT = SCRIPT.with_name("prepare_m08_math_mix.py")
+mix_spec = importlib.util.spec_from_file_location("prepare_m08_math_mix", MIX_SCRIPT)
+mix = importlib.util.module_from_spec(mix_spec)
+mix_spec.loader.exec_module(mix)
 
 
 def test_normalization_preserves_paragraphs_and_rejects_bad_text():
@@ -68,12 +72,15 @@ def corpus(tmp_path):
     return root, path
 
 
-def run_prepare(monkeypatch, corpus, output, tokens=512):
+def run_prepare(monkeypatch, corpus, output, tokens=512, exclude_documents=None):
     root, tokenizer = corpus
-    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--input-dir", str(root),
-                        "--tokenizer", str(tokenizer), "--output-dir", str(output),
-                        "--train-tokens", str(tokens), "--validation-tokens", str(tokens),
-                        "--sequence-length", "16", "--validation-fraction", "0.5", "--batch-size", "4"])
+    argv = [str(SCRIPT), "--input-dir", str(root),
+            "--tokenizer", str(tokenizer), "--output-dir", str(output),
+            "--train-tokens", str(tokens), "--validation-tokens", str(tokens),
+            "--sequence-length", "16", "--validation-fraction", "0.5", "--batch-size", "4"]
+    if exclude_documents is not None:
+        argv.extend(("--exclude-documents", str(exclude_documents)))
+    monkeypatch.setattr(sys, "argv", argv)
     prepare.main()
 
 
@@ -110,6 +117,20 @@ def test_insufficient_corpus_is_reported_and_duplicates_are_removed(monkeypatch,
     assert sum(split["documents"] for split in summary["splits"].values()) == 60
 
 
+def test_prior_document_index_is_excluded_before_packing(monkeypatch, corpus, tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    run_prepare(monkeypatch, corpus, first, tokens=128)
+    index = first / "documents.jsonl"
+    run_prepare(monkeypatch, corpus, second, tokens=128, exclude_documents=index)
+    old = {json.loads(line)["sha256"] for line in index.read_text().splitlines()}
+    new = {json.loads(line)["sha256"] for line in (second / "documents.jsonl").read_text().splitlines()}
+    summary = json.loads((second / "summary.json").read_text())
+    assert summary["status"] == "complete"
+    assert old.isdisjoint(new)
+    assert summary["exclusion"]["unique_hashes"] == len(old)
+    assert summary["exclusion"]["skipped_documents"] > 0
+
+
 def test_invalid_parquet_is_not_silently_skipped(monkeypatch, corpus, tmp_path):
     root, _ = corpus
     for path in root.rglob("*.parquet"):
@@ -118,3 +139,58 @@ def test_invalid_parquet_is_not_silently_skipped(monkeypatch, corpus, tmp_path):
     with pytest.raises(RuntimeError, match="读取 Parquet 失败"):
         run_prepare(monkeypatch, corpus, output)
     assert not (output / "summary.json").exists()
+
+
+def test_m08_math_mix_is_reproducible_and_excludes_both_document_indexes(monkeypatch, corpus, tmp_path):
+    fineweb = tmp_path / "fineweb"
+    run_prepare(monkeypatch, corpus, fineweb)
+    overlap = json.loads((fineweb / "preview.jsonl").read_text().splitlines()[0])["text_preview"]
+    math_texts = [f"word{index} explains mathematics and algebra with several detailed examples. " * 5
+                  for index in range(100)]
+    math_root = tmp_path / "openwebmath"
+    (math_root / "data").mkdir(parents=True)
+    texts = []
+    for start in range(0, len(math_texts), 10):
+        texts.extend((overlap, math_texts[0], *math_texts[start:start + 10]))
+    for shard, selected in enumerate((texts[:60], texts[60:])):
+        pq.write_table(pa.table({"text": selected,
+                                 "url": [f"https://math.example/{shard}/{index}"
+                                         for index in range(len(selected))]}),
+                       math_root / f"data/train-{shard}.parquet", row_group_size=12)
+    other_exclusion = tmp_path / "m04_documents.jsonl"
+    other_text, _ = prepare.normalize_text(math_texts[0], 200, 100_000)
+    import hashlib
+    other_exclusion.write_text(json.dumps({"sha256": hashlib.sha256(other_text.encode()).hexdigest()}) + "\n")
+
+    def run_mix(output):
+        monkeypatch.setattr(sys, "argv", [str(MIX_SCRIPT), "--math-input-dir", str(math_root),
+                                        "--fineweb-data-dir", str(fineweb),
+                                        "--exclude-documents", str(fineweb / "documents.jsonl"),
+                                        "--exclude-documents", str(other_exclusion),
+                                        "--output-dir", str(output),
+                                        "--fineweb-train-sequences", "24", "--math-train-sequences", "24",
+                                        "--validation-sequences", "16", "--sequence-length", "16",
+                                        "--validation-fraction", "0.5", "--batch-size", "12"])
+        mix.main()
+
+    first, second = tmp_path / "mixed_first", tmp_path / "mixed_second"
+    run_mix(first)
+    run_mix(second)
+    summary = json.loads((first / "summary.json").read_text())
+    assert summary["status"] == "complete"
+    assert summary["splits"]["train"]["fineweb_sequences"] == 24
+    assert summary["splits"]["train"]["openwebmath_sequences"] == 24
+    assert summary["splits"]["train"]["written_tokens"] == 768
+    assert summary["splits"]["validation"]["written_tokens"] == 256
+    assert summary["source"]["openwebmath"]["counts"]["excluded_documents"] >= 2
+    assert len(summary["source"]["openwebmath"]["files_read"]) == 2
+    excluded = {json.loads(line)["sha256"] for line in (fineweb / "documents.jsonl").read_text().splitlines()}
+    excluded.add(json.loads(other_exclusion.read_text())["sha256"])
+    math_docs = [json.loads(line) for line in (first / "math_documents.jsonl").read_text().splitlines()]
+    assert {doc["sha256"] for doc in math_docs}.isdisjoint(excluded)
+    assert len({doc["sha256"] for doc in math_docs}) == len(math_docs)
+    for name in ("train.bin", "validation.bin", "math_documents.jsonl"):
+        assert (first / name).read_bytes() == (second / name).read_bytes()
+    assert np.fromfile(first / "train.bin", dtype="<u2").reshape(48, 16).shape == (48, 16)
+    with pytest.raises(FileExistsError):
+        run_mix(first)
