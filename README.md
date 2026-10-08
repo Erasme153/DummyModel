@@ -2,7 +2,7 @@
 
 DummyM 是一个面向初学者的、从零实现并预训练 Llama-like Decoder-only 语言模型的学习型工程。项目以原生 PyTorch 为核心，目标是在两张 NVIDIA H20 或等价算力的 GPU 上跑通模型与 Tokenizer 实现、数据工程、预训练、scaling、分布式训练、评测、后训练和推理流程。
 
-> 当前状态：M1–M7 的既定实验已完成。M4 的 213M base model 已训练 1B tokens，同集验证 loss 为 2.878212；M5 的 scaling 结论仅适用于已测模型与预算；M6 完成优化器对照，M7 完成 MoE、QB 和双卡 EP 对照。详见 [实验报告索引](experiments/README.md)。
+> 当前状态：M1–M9 的既定实验与报告已完成；M0 的自训练 BPE Tokenizer 仍待实现。M8 完成 213M 模型的 cooldown 与数学数据混合对照，M9 完成 UltraFeedback SFT/DPO 和 GSM8K SFT/GRPO。GRPO 的 GSM8K pass@4 从 4.70% 升至 6.44%，但答案集中，不能据此认定推理能力提高。结果与限制见 [实验报告索引](experiments/README.md)。
 
 ## 项目定位与 Marin 的关系
 
@@ -38,10 +38,12 @@ DummyM 选择 PyTorch，是为了在两张 H20 上优先学习模型数学、训
 | 模型单元测试 | 已实现 | 覆盖 RMSNorm、RoPE、模型前向传播和生成逻辑 |
 | Scaling 配置 | 初步等算力对照已完成 | 39M、99M、213M 已在两档近似算力预算下比较；更大 ladder 与 scaling law 仍待验证 |
 | Tokenizer 训练 | 待实现 | 计划使用 Hugging Face Tokenizers 自行训练 BPE |
-| 数据流水线 | 最小版已实现 | 本地 FineWeb-Edu 的分批读取、轻量过滤、精确去重、文档划分和定长 packing；暂用 PyArrow，不依赖 Datasets/DataTrove |
+| 数据流水线 | 已用于 M1–M9 | FineWeb-Edu 与 OpenWebMath 的过滤、去重、划分和定长 packing；UltraFeedback 与 GSM8K 的审计和独立划分；使用 PyArrow，尚未接入 DataTrove |
 | 预训练与分布式 | M3 已验收 | 99M 单卡/DDP/FSDP2 完整预算对照、恢复与加载，Nsight 短程剖析及 213M 双卡短跑已完成；TorchTitan 待实现 |
-| 训练参数对比 | M2 LR 与 warmup 对比已完成 | 99M 当前采用 LR=1e-3、warmup=300，两个 seed 均改善；checkpoint 加载和生成通过，语言能力仍有限 |
-| 评测、后训练和部署 | Base eval 已实现 | 已接入同集 loss 评测与 lm-evaluation-harness 零样本任务；TRL 和 vLLM 待实现 |
+| 训练参数对比 | M2、M6 已验收 | M2 确定 99M 基线 LR=1e-3、warmup=300；M6 完成 AdamW、MuonW、MuonH、AdamH 固定预算对照 |
+| 评测 | 已用于 M4–M9 | 同集/独立验证 loss、lm-evaluation-harness 零样本任务、GSM8K 留出集与官方测试；结果见各阶段报告 |
+| 后训练 | M9 已验收 | 原生 PyTorch 实现 SFT、DPO、GRPO 训练入口、目标函数测试及 checkpoint 恢复；GRPO 的行为采样分布与概率比尚未严格对齐，见 [M9 报告](experiments/m09_posttraining/exp001_sft_dpo_grpo/README.md) |
+| 推理与部署 | 本地推理已实现 | checkpoint 加载、文本生成和评测可运行；vLLM 服务尚未接入 |
 
 ## 模型结构
 
@@ -66,7 +68,7 @@ LM Head
 Vocabulary logits
 ```
 
-核心代码位于 [`src/dummym/models/llama_like`](src/dummym/models/llama_like)。当前实现用于理解和验证模型原理，还没有经过大规模训练正确性与性能验证。
+核心代码位于 [`src/dummym/models/llama_like`](src/dummym/models/llama_like)。该实现已用于 39M、99M 和 213M 的教学训练实验，尚未验证工业规模训练。
 
 ## 环境安装
 
@@ -273,31 +275,32 @@ p039m → p077m → p151m → p297m → p584m → p1150m
 **training recipe** 研究 learning rate、batch size 和 schedule。真正开始 scaling
 实验时再为批量运行增加配置文件。
 
-## 计划采用的技术栈
+## 技术栈与计划
 
-| 环节 | 计划方案 |
+| 环节 | 当前实现 / 后续计划 |
 | --- | --- |
 | 模型与基础训练 | 原生 PyTorch |
 | 双卡与大模型训练 | 原生 DDP 与 FSDP2；TorchTitan 待接入 |
 | Attention | PyTorch SDPA / Flash Attention backend |
-| 数据处理 | Hugging Face Datasets + DataTrove |
-| Tokenizer | Hugging Face Tokenizers，自训练 BPE |
-| 实验记录 | W&B 或 TensorBoard |
+| 数据处理 | 现用 PyArrow；Datasets/DataTrove 待接入 |
+| Tokenizer | 现用 Mistral 32K；自训练 BPE 待实现 |
+| 实验记录 | 现用 TensorBoard；W&B 未接入 |
 | 预训练评测 | lm-evaluation-harness |
-| 后训练 | TRL |
-| 推理与快速评测 | vLLM |
-| 性能分析 | `torch.profiler` + Nsight Systems |
+| 后训练 | 现用原生 PyTorch SFT/DPO/GRPO；TRL 未接入 |
+| 推理与快速评测 | 现用本地推理与评测脚本；vLLM 未接入 |
+| 性能分析 | 已用 Nsight Systems；`torch.profiler` 可按需接入 |
 | Scaling 分析 | NumPy、SciPy、pandas、matplotlib |
 
-除 PyTorch 和 Hugging Face Tokenizers 外，上表多数方案尚未集成。当前数据准备
-使用 `.[data]` 中的 PyArrow 和 NumPy，先完成本地流程。
+当前实验使用 PyTorch、Hugging Face Tokenizers、PyArrow、TensorBoard、
+lm-evaluation-harness 和 Nsight；其余候选组件按实际需求再接入。
 
 ## 数据方案（草案）
 
 首轮 M1 已选定纯 FineWeb-Edu 英文基线，来源、处理规则及限制记录在实验 README。
-后续候选语料配比为 80% FineWeb-Edu、10% The Stack v2 deduplicated 和 10% OpenWebMath。
-该比例尚未冻结；引入新来源前再核对许可证、访问条件、字段格式、去重范围和实际
-token 统计。下图为后续扩展方案，自训练 Tokenizer 和 DataTrove 不作为本轮前置条件。
+M8 已检验 FineWeb-Edu 与 OpenWebMath 各 50% 的固定预算混合。更早提出的
+80% FineWeb-Edu、10% The Stack v2 deduplicated 和 10% OpenWebMath 只是
+未执行的候选方案，不是当前训练配方。下图为后续扩展草案，自训练 Tokenizer
+和 DataTrove 不作为已完成实验的前置条件。
 
 ```text
 Hugging Face Datasets streaming
